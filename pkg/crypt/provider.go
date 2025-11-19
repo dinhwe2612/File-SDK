@@ -2,42 +2,74 @@ package crypt
 
 import (
 	"context"
+	"encoding/hex"
 	"errors"
+	"fmt"
+
+	"github.com/pilacorp/nda-reencryption-sdk/pre"
 )
 
-type ProviderOpts struct {
-	PrivateKeyHex string
-	OwnerDID      string
+// ProviderOpt configures provider options.
+type ProviderOpt func(*providerOptions)
+
+// providerOptions holds configuration for provider operations.
+type providerOptions struct {
+	privateKeyHex string
+	customOptions map[string]any
 }
 
-// WithOwnerPrivateKeyHex returns a copy of ProviderOpts with OwnerPrivateKeyHex set.
-func (o ProviderOpts) WithOwnerPrivateKeyHex(hex string) ProviderOpts {
-	o.PrivateKeyHex = hex
-	return o
+// WithPrivateKeyHex sets the private key in hex format.
+func WithPrivateKeyHex(privateKeyHex string) ProviderOpt {
+	return func(o *providerOptions) {
+		o.privateKeyHex = privateKeyHex
+	}
 }
 
-// WithOwnerDID returns a copy of ProviderOpts with OwnerDID set.
-func (o ProviderOpts) WithOwnerDID(did string) ProviderOpts {
-	o.OwnerDID = did
-	return o
+// WithCustomProvider sets custom provider data.
+func WithCustomProvider(customOptions map[string]any) ProviderOpt {
+	return func(o *providerOptions) {
+		o.customOptions = customOptions
+	}
+}
+
+// getProviderOptions returns the providerOptions with defaults applied.
+func getProviderOptions(opts ...ProviderOpt) *providerOptions {
+	options := &providerOptions{
+		privateKeyHex: "",
+		customOptions: make(map[string]any),
+	}
+
+	for _, opt := range opts {
+		opt(options)
+	}
+
+	return options
 }
 
 type Provider interface {
-	NewPreDecryptor(ctx context.Context, capsule string, opts ProviderOpts) (*PreDecryptor, error)
+	NewPreDecryptor(ctx context.Context, capsule string, opts ...ProviderOpt) (*pre.Decryptor, error)
 }
 
 type DefaultProvider struct{}
 
-func (p *DefaultProvider) NewPreDecryptor(ctx context.Context, capsule string, opts ProviderOpts) (*PreDecryptor, error) {
+func (p *DefaultProvider) NewPreDecryptor(ctx context.Context, capsule string, opts ...ProviderOpt) (*pre.Decryptor, error) {
 	if capsule == "" {
 		return nil, errors.New("capsule is required")
 	}
-	if opts.PrivateKeyHex == "" {
-		return nil, errors.New("owner private key hex is required")
+
+	options := getProviderOptions(opts...)
+	if options.privateKeyHex == "" {
+		return nil, errors.New("owner private key hex is required (use WithPrivateKeyHex option)")
 	}
 
-	return NewPreDecryptor(PreDecryptorOptions{
-		PrivateKeyHex: opts.PrivateKeyHex,
-		CapsuleHex:    capsule,
-	})
+	capsuleBytes, err := hex.DecodeString(capsule)
+	if err != nil {
+		return nil, fmt.Errorf("decode capsule: %w", err)
+	}
+
+	if len(capsuleBytes) == 185 {
+		return pre.NewDecryptorByOwner(options.privateKeyHex, capsuleBytes)
+	} else {
+		return pre.NewDecryptor(options.privateKeyHex, capsuleBytes)
+	}
 }

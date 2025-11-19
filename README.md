@@ -44,7 +44,7 @@ info, err := client.PutObject(ctx, ownerDID, "example.txt", file, 0, filesdk.Put
 })
 
 // Download the file
-obj, err := client.GetObject(ctx, ownerDID, info.Key, filesdk.GetObjectOptions{})
+obj, err := client.GetObject(ctx, ownerDID, info.CID, filesdk.GetObjectOptions{})
 // ... read from obj
 ```
 
@@ -113,7 +113,7 @@ Uploads a file to the gateway.
 - `VerificationMethod` (string): DID verification method ID used to fetch the public key (defaults to `<ownerDID>#key-1` if empty)
 
 **Returns:**
-- `UploadInfo`: Contains `Bucket`, `Key` (CID), `ETag`, and `Size`
+- `UploadInfo`: Contains `CID`, `OwnerDID`, `CreatedAt`, `FileName`, `FileType`, `AccessLevel`, `IssuerDID`, `Size`, `Capsule`, and `OwnerVCJWT`
 
 ### GetObject
 

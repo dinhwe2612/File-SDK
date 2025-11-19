@@ -11,16 +11,20 @@ import (
 	"github.com/dinhwe2612/file-sdk/pkg/crypt"
 )
 
+// Resolver interface for resolving public keys from verification method URLs
+type Resolver interface {
+	GetPublicKey(verificationMethodURL string) (string, error)
+}
+
 // Client is a minimal S3-compatible client wrapper that follows PutObject/GetObject interface patterns.
 // It does not attempt to replicate the full AWS S3 protocol, but provides a custom implementation skeleton
 // that allows you to inject custom logic for signing, authentication, encryption, etc.
 type Client struct {
-	endpoint           *url.URL
-	httpClient         *http.Client
-	defaultHdrs        http.Header
-	cryptProvider      crypt.Provider
-	resolverUrl        string
-	verificationMethod string
+	endpoint      *url.URL
+	httpClient    *http.Client
+	defaultHdrs   http.Header
+	cryptProvider crypt.Provider
+	resolver      Resolver
 }
 
 const (
@@ -32,7 +36,8 @@ const (
 
 // Config is used to initialize Client.
 type Config struct {
-	// Endpoint like https://example.com/api/v1 or http://127.0.0.1:9000.
+	// Endpoint is the gateway domain (e.g., https://example.com or http://127.0.0.1:9000).
+	// The SDK will automatically append /api/v1 to the path if not already present.
 	Endpoint string
 	// Default timeout. If empty, uses 30 seconds.
 	Timeout time.Duration
@@ -43,6 +48,9 @@ type Config struct {
 	// CryptProvider allows customizing how decryptors are constructed for private downloads.
 	// If nil, a DefaultProvider (using OwnerPrivateKeyHex) is used.
 	CryptProvider crypt.Provider
+	// Resolver is required for resolving public keys from verification method URLs.
+	// Used for private file uploads to encrypt data.
+	Resolver Resolver
 }
 
 // New creates a Client.
@@ -52,13 +60,23 @@ func New(cfg Config) (*Client, error) {
 	}
 
 	rawEndpoint := cfg.Endpoint
-	if !strings.Contains(rawEndpoint, "://") {
-		rawEndpoint = "https://" + rawEndpoint
-	}
 
 	u, err := url.Parse(rawEndpoint)
 	if err != nil {
 		return nil, fmt.Errorf("invalid endpoint: %w", err)
+	}
+
+	// Automatically append /api/v1 if path is empty or just "/"
+	// If user provides just the domain, we add the API path prefix
+	path := strings.TrimSuffix(u.Path, "/")
+	if path == "" || path == "/" {
+		u.Path = "/api/v1"
+	} else if !strings.HasPrefix(path, "/api/v1") {
+		// If path doesn't start with /api/v1, prepend it
+		u.Path = "/api/v1" + u.Path
+	} else {
+		// Path already contains /api/v1, keep it as is
+		u.Path = path
 	}
 
 	httpClient := cfg.HTTPClient
@@ -83,11 +101,17 @@ func New(cfg Config) (*Client, error) {
 		cryptProv = &crypt.DefaultProvider{}
 	}
 
+	// Validate resolver is provided
+	if cfg.Resolver == nil {
+		return nil, errors.New("resolver is required")
+	}
+
 	return &Client{
 		endpoint:      u,
 		httpClient:    httpClient,
 		defaultHdrs:   defaultHdrs,
 		cryptProvider: cryptProv,
+		resolver:      cfg.Resolver,
 	}, nil
 }
 

@@ -6,60 +6,71 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"net/url"
-	"path"
 	"strings"
-	"sync"
 
 	"github.com/dinhwe2612/file-sdk/pkg/credential"
 	"github.com/dinhwe2612/file-sdk/pkg/crypt"
 )
 
-// GetObjectOptions represents options for GetObject call
-type GetObjectOptions struct {
-	// privateKeyHex is the hex-encoded private key for decrypting private objects.
-	// Required when fetching private objects.
-	PrivateKeyHex string
-	// Headers
-	Headers http.Header
-	// Range
-	Range string
+// GetObjectOpt configures GetObject call options.
+type GetObjectOpt func(*getObjectOptions)
+
+// getObjectOptions holds configuration for GetObject call.
+type getObjectOptions struct {
+	headers      http.Header
+	providerOpts []crypt.ProviderOpt
+}
+
+// WithHeaders sets custom HTTP headers for the request.
+func WithHeaders(headers http.Header) GetObjectOpt {
+	return func(o *getObjectOptions) {
+		o.headers = headers
+	}
+}
+
+// WithProviderOpts sets the provider options for decryption.
+func WithProviderOpts(opts ...crypt.ProviderOpt) GetObjectOpt {
+	return func(o *getObjectOptions) {
+		o.providerOpts = opts
+	}
+}
+
+// getGetObjectOptions returns the getObjectOptions with defaults applied.
+func getGetObjectOptions(opts ...GetObjectOpt) *getObjectOptions {
+	options := &getObjectOptions{
+		headers:      make(http.Header),
+		providerOpts: []crypt.ProviderOpt{},
+	}
+
+	for _, opt := range opts {
+		opt(options)
+	}
+
+	return options
 }
 
 // ObjectInfo contains information about an object
 type ObjectInfo struct {
-	ETag        string
-	Key         string
+	CID         string
 	Size        int64
 	ContentType string
 	Metadata    http.Header
 }
 
-// Object represents an open object. It implements
-// Reader, ReaderAt, Seeker, Closer for a HTTP stream.
-type Object struct {
-	// Mutex for thread safety
-	mutex *sync.Mutex
-
-	// Context and cancel
-	ctx    context.Context
-	cancel context.CancelFunc
-
-	// HTTP response
-	httpReader io.ReadCloser
-	objectInfo ObjectInfo
-
-	// Current offset
-	currOffset int64
-
-	// State flags
-	isClosed bool
-	prevErr  error
+// GetObjectResult represents the result of a GetObject operation.
+// It contains the object data as an io.ReadCloser and metadata.
+type GetObjectResult struct {
+	// Body is the object data stream. The caller must close it when done.
+	Body io.ReadCloser
+	// Info contains the object metadata.
+	Info ObjectInfo
 }
 
 // GetObject retrieves an object from storage.
 // bucketName represents the owner DID, objectName is the CID.
-func (c *Client) GetObject(ctx context.Context, bucketName, objectName string, opts GetObjectOptions) (*Object, error) {
+// Returns a GetObjectResult containing the object data stream and metadata.
+// The caller must close the Body when done reading.
+func (c *Client) GetObject(ctx context.Context, bucketName, objectName string, opts ...GetObjectOpt) (*GetObjectResult, error) {
 	if bucketName == "" {
 		return nil, errors.New("owner DID (bucketName) is required")
 	}
@@ -67,23 +78,21 @@ func (c *Client) GetObject(ctx context.Context, bucketName, objectName string, o
 		return nil, errors.New("object name (CID) is required")
 	}
 
-	// Build URL for IPFS endpoint - objectName (CID) is used as path parameter
-	target := c.endpoint.ResolveReference(&url.URL{
-		Path: path.Join(c.endpoint.Path, "files", objectName),
-	})
+	// Build URL for file endpoint - objectName (CID) is used as path parameter
+	// The endpoint already includes /api/v1, so we just append /files/{cid}
+	targetURL := fmt.Sprintf("%s/files/%s", c.endpoint.String(), objectName)
 
 	// Create request
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target.String(), nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, targetURL, nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
 
-	// Set headers - bucketName carries the owner DID
-	req.Header.Set("X-Issuer-Did", bucketName)
-	c.mergeHeaders(req.Header, opts.Headers)
-	if opts.Range != "" {
-		req.Header.Set("Range", opts.Range)
-	}
+	// Parse options
+	options := getGetObjectOptions(opts...)
+
+	// Set headers
+	c.mergeHeaders(req.Header, options.headers)
 
 	// Execute request
 	resp, err := c.httpClient.Do(req)
@@ -91,26 +100,28 @@ func (c *Client) GetObject(ctx context.Context, bucketName, objectName string, o
 		return nil, fmt.Errorf("failed to get object: %w", err)
 	}
 
+	// Defer close resp.Body unless we successfully return it to the caller
+	shouldCloseBody := true
+	defer func() {
+		if shouldCloseBody {
+			resp.Body.Close()
+		}
+	}()
+
 	if resp.StatusCode >= 400 {
-		defer resp.Body.Close()
 		return nil, fmt.Errorf("get object failed: status=%d", resp.StatusCode)
 	}
 
 	// Parse object info from headers
-	etag := objectName // Use CID as ETag
 	contentType := resp.Header.Get("Content-Type")
 	contentLength := resp.ContentLength
 
 	objectInfo := ObjectInfo{
-		ETag:        etag,
-		Key:         objectName, // CID
+		CID:         objectName,
 		Size:        contentLength,
 		ContentType: contentType,
 		Metadata:    cloneHeader(resp.Header),
 	}
-
-	// Create context with cancel
-	gctx, cancel := context.WithCancel(ctx)
 
 	// Check access level from response header (X-Access-Level)
 	// The server returns "private" or "public" in X-Access-Level header
@@ -125,7 +136,6 @@ func (c *Client) GetObject(ctx context.Context, bucketName, objectName string, o
 
 		if jwtToken != "" {
 			capsule, _ = credential.CapsuleFromJWT(jwtToken)
-			println("capsule from jwt", capsule)
 		}
 	}
 
@@ -133,190 +143,38 @@ func (c *Client) GetObject(ctx context.Context, bucketName, objectName string, o
 
 	// If object is private and we have a private key, decrypt
 	if accessLevel == "private" {
-		if opts.PrivateKeyHex == "" {
-			cancel()
-			resp.Body.Close()
-			return nil, errors.New("owner private key (hex) is required for private objects")
-		}
-
 		if capsule == "" {
-			cancel()
-			resp.Body.Close()
 			return nil, errors.New("encrypted capsule is missing for private object")
 		}
 
-		decryptor, err := c.cryptProvider.NewPreDecryptor(gctx, capsule, crypt.ProviderOpts{
-			PrivateKeyHex: opts.PrivateKeyHex,
-		})
+		// Validate ProviderOpts is provided
+		if len(options.providerOpts) == 0 {
+			return nil, errors.New("provider options are required for private objects (use WithProviderOpts)")
+		}
+
+		// Get decryptor from provider
+		decryptor, err := c.cryptProvider.NewPreDecryptor(ctx, capsule, options.providerOpts...)
 		if err != nil {
-			cancel()
-			resp.Body.Close()
-			return nil, fmt.Errorf("failed to decrypt object: %w", err)
+			return nil, fmt.Errorf("failed to create decryptor: %w", err)
 		}
 
-		reader, err = decryptor.Decrypt(gctx, resp.Body)
-		if err != nil {
-			cancel()
-			resp.Body.Close()
-			return nil, fmt.Errorf("failed to decrypt object: %w", err)
-		}
+		// Decrypt the stream using a pipe
+		pipeReader, pipeWriter := io.Pipe()
+		go func() {
+			defer pipeWriter.Close()
+			if err := decryptor.DecryptStream(ctx, resp.Body, pipeWriter); err != nil {
+				pipeWriter.CloseWithError(fmt.Errorf("decrypt stream failed: %w", err))
+				return
+			}
+		}()
+
+		reader = pipeReader
 	}
 
-	obj := &Object{
-		mutex:      &sync.Mutex{},
-		ctx:        gctx,
-		cancel:     cancel,
-		httpReader: reader,
-		objectInfo: objectInfo,
-		currOffset: 0,
-		isClosed:   false,
-	}
-
-	return obj, nil
-}
-
-// Read reads up to len(b) bytes into b. It returns the number of
-// bytes read (0 <= n <= len(b)) and any error encountered. Returns
-// io.EOF upon end of file.
-func (o *Object) Read(b []byte) (n int, err error) {
-	if o == nil {
-		return 0, errors.New("object is nil")
-	}
-
-	o.mutex.Lock()
-	defer o.mutex.Unlock()
-
-	if o.prevErr != nil || o.isClosed {
-		return 0, o.prevErr
-	}
-
-	n, err = o.httpReader.Read(b)
-	if err != nil && err != io.EOF {
-		o.prevErr = err
-		return n, err
-	}
-
-	o.currOffset += int64(n)
-
-	if err == io.EOF {
-		o.prevErr = io.EOF
-	}
-
-	return n, err
-}
-
-// ReadAt reads len(b) bytes from the File starting at byte offset
-// off. It returns the number of bytes read and the error, if any.
-// ReadAt always returns a non-nil error when n < len(b). At end of
-// file, that error is io.EOF.
-func (o *Object) ReadAt(b []byte, offset int64) (n int, err error) {
-	if o == nil {
-		return 0, errors.New("object is nil")
-	}
-
-	o.mutex.Lock()
-	defer o.mutex.Unlock()
-
-	if o.prevErr != nil && o.prevErr != io.EOF || o.isClosed {
-		return 0, o.prevErr
-	}
-
-	// For ReadAt, we need to seek to the offset first
-	// This is a simplified implementation
-	// In a full implementation, this would use Range requests
-	if offset != o.currOffset {
-		// For encrypted objects, we can't easily seek
-		// This would require re-fetching with Range header
-		return 0, errors.New("ReadAt not fully supported for encrypted objects")
-	}
-
-	return o.Read(b)
-}
-
-// Seek sets the offset for the next Read or Write to offset,
-// interpreted according to whence: 0 means relative to the
-// origin of the file, 1 means relative to the current offset,
-// and 2 means relative to the end.
-// Seek returns the new offset and an error, if any.
-func (o *Object) Seek(offset int64, whence int) (n int64, err error) {
-	if o == nil {
-		return 0, errors.New("object is nil")
-	}
-
-	o.mutex.Lock()
-	defer o.mutex.Unlock()
-
-	if o.prevErr != nil && o.prevErr != io.EOF {
-		return 0, o.prevErr
-	}
-
-	var newOffset int64
-	switch whence {
-	case io.SeekStart:
-		if offset < 0 {
-			return 0, errors.New("negative position not allowed")
-		}
-		newOffset = offset
-	case io.SeekCurrent:
-		newOffset = o.currOffset + offset
-	case io.SeekEnd:
-		if o.objectInfo.Size < 0 {
-			return 0, errors.New("seek end not supported when object size is unknown")
-		}
-		newOffset = o.objectInfo.Size + offset
-	default:
-		return 0, fmt.Errorf("invalid whence %d", whence)
-	}
-
-	if newOffset < 0 {
-		return 0, errors.New("negative position not allowed")
-	}
-
-	o.currOffset = newOffset
-	o.prevErr = nil
-
-	return o.currOffset, nil
-}
-
-// Stat returns the ObjectInfo structure describing Object.
-func (o *Object) Stat() (ObjectInfo, error) {
-	if o == nil {
-		return ObjectInfo{}, errors.New("object is nil")
-	}
-
-	o.mutex.Lock()
-	defer o.mutex.Unlock()
-
-	if o.prevErr != nil && o.prevErr != io.EOF || o.isClosed {
-		return ObjectInfo{}, o.prevErr
-	}
-
-	return o.objectInfo, nil
-}
-
-// Close closes the object and releases any resources.
-// The behavior of Close after the first call returns error
-// for subsequent Close() calls.
-func (o *Object) Close() (err error) {
-	if o == nil {
-		return errors.New("object is nil")
-	}
-
-	o.mutex.Lock()
-	defer o.mutex.Unlock()
-
-	if o.isClosed {
-		return o.prevErr
-	}
-
-	o.cancel()
-
-	if o.httpReader != nil {
-		err = o.httpReader.Close()
-	}
-
-	o.isClosed = true
-	o.prevErr = errors.New("object is already closed")
-
-	return err
+	// Success: we're returning the body to the caller, so don't close it
+	shouldCloseBody = false
+	return &GetObjectResult{
+		Body: reader,
+		Info: objectInfo,
+	}, nil
 }

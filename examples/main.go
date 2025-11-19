@@ -14,6 +14,8 @@ import (
 	"time"
 
 	filesdk "github.com/dinhwe2612/file-sdk"
+	"github.com/dinhwe2612/file-sdk/pkg/crypt"
+	verificationmethod "github.com/pilacorp/go-credential-sdk/credential/common/verification-method"
 )
 
 var (
@@ -26,17 +28,22 @@ var (
 func main() {
 	ctx := context.Background()
 
-	// Create a client pointing to the gateway endpoint
-	gatewayURL := "http://localhost:8083/api/v1" // Adjust to your gateway URL
+	// Create a client pointing to the gateway domain
+	// The SDK will automatically append /api/v1 to the path
+	gatewayURL := "http://localhost:8083"                // Just the domain, SDK adds /api/v1
+	resolverURL := "https://auth-dev.pila.vn/api/v1/did" // Replace with your DID resolver endpoint
+
+	// Create resolver
+	resolver := verificationmethod.NewResolver(resolverURL)
+
 	client, err := filesdk.New(filesdk.Config{
 		Endpoint: gatewayURL,
 		Timeout:  30 * time.Second,
+		Resolver: resolver,
 	})
 	if err != nil {
 		log.Fatalf("create client: %v", err)
 	}
-
-	resolverURL := "https://auth-dev.pila.vn/api/v1/did" // Replace with your DID resolver endpoint
 	// Load file content to upload. Prefer the example's go.mod; fall back to local go.mod.
 	filePath := "examples/go.mod"
 	content, err := os.ReadFile(filePath)
@@ -83,17 +90,16 @@ func main() {
 
 func upload(ctx context.Context, client *filesdk.Client, issuerDID, ownerDID, resolverURL, objectName, filePath string, content []byte) (string, error) {
 	fmt.Printf("Uploading %q to gateway…\n", filePath)
-	uploadInfo, err := client.PutObject(ctx, ownerDID, objectName, bytes.NewReader(content), int64(len(content)), filesdk.PutObjectOptions{
-		AccessType:  filesdk.AccessTypePrivate,
-		ContentType: "text/plain",
-		IssuerDID:   issuerDID,
-		ResolverURL: resolverURL,
-	})
+	uploadInfo, err := client.PutObject(ctx, ownerDID, objectName, bytes.NewReader(content), int64(len(content)),
+		filesdk.WithAccessType(filesdk.AccessTypePrivate),
+		filesdk.WithContentType("text/plain"),
+		filesdk.WithIssuerDID(issuerDID),
+	)
 	if err != nil {
 		return "", fmt.Errorf("upload object: %w", err)
 	}
 
-	return uploadInfo.Key, nil
+	return uploadInfo.CID, nil
 }
 
 func download(ctx context.Context, client *filesdk.Client, ownerDID, cid, viewerJWT string) error {
@@ -105,22 +111,20 @@ func download(ctx context.Context, client *filesdk.Client, ownerDID, cid, viewer
 	headers.Set("Authorization", viewerJWT)
 
 	fmt.Println("Fetching object back from gateway…")
-	obj, err := client.GetObject(ctx, ownerDID, cid, filesdk.GetObjectOptions{
-		Headers:       headers,
-		PrivateKeyHex: issuerPrivateKeyHex,
-	})
+	result, err := client.GetObject(ctx, ownerDID, cid,
+		filesdk.WithHeaders(headers),
+		filesdk.WithProviderOpts(
+			crypt.WithPrivateKeyHex(issuerPrivateKeyHex),
+		),
+	)
 	if err != nil {
 		return fmt.Errorf("get object: %w", err)
 	}
-	defer obj.Close()
+	defer result.Body.Close()
 
-	info, err := obj.Stat()
-	if err != nil {
-		return fmt.Errorf("stat object: %w", err)
-	}
-
+	info := result.Info
 	fmt.Printf("Object Info:\n")
-	fmt.Printf("  CID: %s\n", info.Key)
+	fmt.Printf("  CID: %s\n", info.CID)
 	fmt.Printf("  Content-Type: %s\n", info.ContentType)
 	fmt.Printf("  Size: %d bytes\n", info.Size)
 
@@ -128,7 +132,7 @@ func download(ctx context.Context, client *filesdk.Client, ownerDID, cid, viewer
 	var total int
 	buf := make([]byte, 1024)
 	for {
-		n, err := obj.Read(buf)
+		n, err := result.Body.Read(buf)
 		if n > 0 {
 			total += n
 			fmt.Printf("Read chunk (%d bytes): %s\n", n, string(buf[:n]))

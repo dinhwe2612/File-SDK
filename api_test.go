@@ -14,6 +14,7 @@ import (
 	"time"
 
 	filesdk "github.com/dinhwe2612/file-sdk"
+	verificationmethod "github.com/pilacorp/go-credential-sdk/credential/common/verification-method"
 
 	"github.com/pilacorp/nda-reencryption-sdk/pre"
 	"github.com/pilacorp/nda-reencryption-sdk/utils"
@@ -24,7 +25,7 @@ type mockResolver struct {
 	publicKeyHex string
 }
 
-func (m *mockResolver) GetPublicKey() (string, error) {
+func (m *mockResolver) GetPublicKey(verificationMethodURL string) (string, error) {
 	return m.publicKeyHex, nil
 }
 
@@ -79,16 +80,22 @@ func TestPutObjectPublic(t *testing.T) {
 			"access_level": "public",
 			"issuer_did":   issuerDID,
 			"size":         42,
+			"capsule":      "",
+			"owner_vc_jwt": "",
 		}
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(response)
 	}))
 	defer server.Close()
 
+	// Create a mock resolver for public uploads (not actually used for public)
+	mockResolver := &mockResolver{publicKeyHex: ""}
+
 	// Create client
 	client, err := filesdk.New(filesdk.Config{
 		Endpoint: server.URL,
 		Timeout:  5 * time.Second,
+		Resolver: mockResolver,
 	})
 	if err != nil {
 		t.Fatalf("Failed to create client: %v", err)
@@ -99,23 +106,17 @@ func TestPutObjectPublic(t *testing.T) {
 	reader := bytes.NewReader(testData)
 
 	// Upload public object - bucketName is owner DID
-	info, err := client.PutObject(context.Background(), ownerDID, "test-key", reader, int64(len(testData)), filesdk.PutObjectOptions{
-		AccessType:  filesdk.AccessTypePublic,
-		ContentType: "text/plain",
-		IssuerDID:   issuerDID,
-	})
+	info, err := client.PutObject(context.Background(), ownerDID, "test-key", reader, int64(len(testData)),
+		filesdk.WithAccessType(filesdk.AccessTypePublic),
+		filesdk.WithContentType("text/plain"),
+		filesdk.WithIssuerDID(issuerDID),
+	)
 	if err != nil {
 		t.Fatalf("Failed to put object: %v", err)
 	}
 
-	if info.Bucket != ownerDID {
-		t.Errorf("Expected bucket '%s', got '%s'", ownerDID, info.Bucket)
-	}
-	if info.Key != "test-cid-123" {
-		t.Errorf("Expected key (CID) 'test-cid-123', got '%s'", info.Key)
-	}
-	if info.ETag != "test-cid-123" {
-		t.Errorf("Expected ETag 'test-cid-123', got '%s'", info.ETag)
+	if info.CID != "test-cid-123" {
+		t.Errorf("Expected CID 'test-cid-123', got '%s'", info.CID)
 	}
 }
 
@@ -228,16 +229,22 @@ func TestPutObjectPrivate(t *testing.T) {
 			"issuer_did":   issuerDID,
 			"encrypt_type": "rsa-aes",
 			"size":         int64(len(receivedData)),
+			"capsule":      capsule,
+			"owner_vc_jwt": "",
 		}
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(response)
 	}))
 	defer server.Close()
 
-	// Create client
+	// Create resolver using verificationmethod package
+	resolver := verificationmethod.NewResolver(resolverServer.URL)
+
+	// Create client with resolver
 	client, err := filesdk.New(filesdk.Config{
 		Endpoint: server.URL,
 		Timeout:  5 * time.Second,
+		Resolver: resolver,
 	})
 	if err != nil {
 		t.Fatalf("Failed to create client: %v", err)
@@ -246,22 +253,18 @@ func TestPutObjectPrivate(t *testing.T) {
 	reader := bytes.NewReader(testData)
 
 	// Upload private object
-	info, err := client.PutObject(context.Background(), ownerDID, "test-key-private", reader, int64(len(testData)), filesdk.PutObjectOptions{
-		AccessType:         filesdk.AccessTypePrivate,
-		ContentType:        "text/plain",
-		IssuerDID:          issuerDID,
-		ResolverURL:        resolverServer.URL,
-		VerificationMethod: verificationMethod,
-	})
+	info, err := client.PutObject(context.Background(), ownerDID, "test-key-private", reader, int64(len(testData)),
+		filesdk.WithAccessType(filesdk.AccessTypePrivate),
+		filesdk.WithContentType("text/plain"),
+		filesdk.WithIssuerDID(issuerDID),
+		filesdk.WithVerificationMethod(verificationMethod),
+	)
 	if err != nil {
 		t.Fatalf("Failed to put object: %v", err)
 	}
 
-	if info.Bucket != ownerDID {
-		t.Errorf("Expected bucket '%s', got '%s'", ownerDID, info.Bucket)
-	}
-	if info.Key != "test-cid-private-123" {
-		t.Errorf("Expected key (CID) 'test-cid-private-123', got '%s'", info.Key)
+	if info.CID != "test-cid-private-123" {
+		t.Errorf("Expected CID 'test-cid-private-123', got '%s'", info.CID)
 	}
 
 	// Verify data was encrypted (should be different from original)
@@ -310,24 +313,28 @@ func TestGetObjectPublic(t *testing.T) {
 	}))
 	defer server.Close()
 
+	// Create a mock resolver
+	mockResolver := &mockResolver{publicKeyHex: ""}
+
 	// Create client
 	client, err := filesdk.New(filesdk.Config{
 		Endpoint: server.URL,
 		Timeout:  5 * time.Second,
+		Resolver: mockResolver,
 	})
 	if err != nil {
 		t.Fatalf("Failed to create client: %v", err)
 	}
 
 	// Get object - bucketName is ownerDID, objectName is CID
-	obj, err := client.GetObject(context.Background(), ownerDID, "test-cid-123", filesdk.GetObjectOptions{})
+	result, err := client.GetObject(context.Background(), ownerDID, "test-cid-123")
 	if err != nil {
 		t.Fatalf("Failed to get object: %v", err)
 	}
-	defer obj.Close()
+	defer result.Body.Close()
 
 	// Read data
-	readData, err := io.ReadAll(obj)
+	readData, err := io.ReadAll(result.Body)
 	if err != nil {
 		t.Fatalf("Failed to read object: %v", err)
 	}
@@ -337,13 +344,9 @@ func TestGetObjectPublic(t *testing.T) {
 	}
 
 	// Check object info
-	info, err := obj.Stat()
-	if err != nil {
-		t.Fatalf("Failed to stat object: %v", err)
-	}
-
-	if info.Key != "test-cid-123" {
-		t.Errorf("Expected key (CID) 'test-cid-123', got '%s'", info.Key)
+	info := result.Info
+	if info.CID != "test-cid-123" {
+		t.Errorf("Expected CID 'test-cid-123', got '%s'", info.CID)
 	}
 	if info.ContentType != "text/plain" {
 		t.Errorf("Expected content type 'text/plain', got '%s'", info.ContentType)
@@ -405,9 +408,12 @@ func TestPutObjectPrivateMissingVerification(t *testing.T) {
 	}))
 	defer server.Close()
 
+	// Create client with a resolver (resolver is always required now)
+	mockResolver := &mockResolver{publicKeyHex: ""}
 	client, err := filesdk.New(filesdk.Config{
 		Endpoint: server.URL,
 		Timeout:  5 * time.Second,
+		Resolver: mockResolver,
 	})
 	if err != nil {
 		t.Fatalf("Failed to create client: %v", err)
@@ -416,17 +422,18 @@ func TestPutObjectPrivateMissingVerification(t *testing.T) {
 	testData := []byte("test data")
 	reader := bytes.NewReader(testData)
 
-	// Try to upload private object without resolver details
-	_, err = client.PutObject(context.Background(), "test-owner-did", "test-key", reader, int64(len(testData)), filesdk.PutObjectOptions{
-		AccessType: filesdk.AccessTypePrivate,
-		IssuerDID:  "test-issuer-did",
-	})
+	// Try to upload private object - should work with resolver, but might fail on encryption
+	_, err = client.PutObject(context.Background(), "test-owner-did", "test-key", reader, int64(len(testData)),
+		filesdk.WithAccessType(filesdk.AccessTypePrivate),
+		filesdk.WithIssuerDID("test-issuer-did"),
+	)
 
+	// With resolver required, the error will be about getting the public key, not about missing resolver
 	if err == nil {
-		t.Error("Expected error when uploading private object without resolver configuration")
+		t.Error("Expected error when uploading private object with invalid resolver")
 	}
-	if !strings.Contains(err.Error(), "verification method URL is not set") {
-		t.Errorf("Expected error about verification method, got: %v", err)
+	if !strings.Contains(err.Error(), "failed to get public key") && !strings.Contains(err.Error(), "resolver") {
+		t.Errorf("Expected error about resolver or public key, got: %v", err)
 	}
 }
 
@@ -440,16 +447,18 @@ func TestGetObjectPrivateWithoutKey(t *testing.T) {
 	}))
 	defer server.Close()
 
+	mockResolver := &mockResolver{publicKeyHex: ""}
 	client, err := filesdk.New(filesdk.Config{
 		Endpoint: server.URL,
 		Timeout:  5 * time.Second,
+		Resolver: mockResolver,
 	})
 	if err != nil {
 		t.Fatalf("Failed to create client: %v", err)
 	}
 
 	// Try to get private object without private key
-	_, err = client.GetObject(context.Background(), "test-owner-did", "test-cid-123", filesdk.GetObjectOptions{})
+	_, err = client.GetObject(context.Background(), "test-owner-did", "test-cid-123")
 
 	if err == nil {
 		t.Error("Expected error when getting private object without private key")
