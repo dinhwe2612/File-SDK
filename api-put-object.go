@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/dinhwe2612/file-sdk/pkg/credential"
 	"github.com/pilacorp/nda-auth-sdk/provider"
 	pre "github.com/pilacorp/nda-reencryption-sdk/pre"
 )
@@ -47,6 +48,8 @@ type putObjectOptions struct {
 	encryptorChunkSize int
 	signOptions        []provider.SignOption
 	headers            http.Header
+	accessibleSchemaID string
+	pilaAuthURL        string
 }
 
 // WithAccessType sets the access type (public or private).
@@ -104,6 +107,20 @@ func WithHeaders(headers http.Header) PutObjectOpt {
 	}
 }
 
+// WithAccessibleSchemaID sets the accessible schema ID.
+func WithAccessibleSchemaID(id string) PutObjectOpt {
+	return func(o *putObjectOptions) {
+		o.accessibleSchemaID = id
+	}
+}
+
+// WithPilaAuthURL sets the Pila auth URL.
+func WithPilaAuthURL(url string) PutObjectOpt {
+	return func(o *putObjectOptions) {
+		o.pilaAuthURL = url
+	}
+}
+
 // getPutObjectOptions returns the putObjectOptions with defaults applied.
 func getPutObjectOptions(opts ...PutObjectOpt) *putObjectOptions {
 	options := &putObjectOptions{
@@ -151,24 +168,24 @@ func (c *Client) PutObject(
 	opts ...PutObjectOpt,
 ) (UploadInfo, error) {
 	if bucketName == "" {
-		return UploadInfo{}, errors.New("owner DID (bucketName) is required")
+		return UploadInfo{}, errors.New("filesdk: owner DID (bucketName) is required")
 	}
 
 	options := getPutObjectOptions(opts...)
 	if options.issuerDID == "" {
-		return UploadInfo{}, errors.New("issuer DID is required (use WithIssuerDID)")
+		return UploadInfo{}, errors.New("filesdk: issuer DID is required (use WithIssuerDID)")
 	}
 	if objectName == "" {
-		return UploadInfo{}, errors.New("objectName is required")
+		return UploadInfo{}, errors.New("filesdk: objectName is required")
 	}
 	if applicationDID == "" {
-		return UploadInfo{}, errors.New("application DID is not configured (use SetApplicationDID)")
+		return UploadInfo{}, errors.New("filesdk: application DID is not configured (use SetApplicationDID)")
 	}
 	if gatewayTrustJWT == "" {
-		return UploadInfo{}, errors.New("gateway trust JWT is not configured (use SetGatewayTrustJWT)")
+		return UploadInfo{}, errors.New("filesdk: gateway trust JWT is not configured (use SetGatewayTrustJWT)")
 	}
 
-	// Determine access level from AccessType
+	// Determine access level from AccessType.
 	accessLevel := "public"
 	if options.accessType == AccessTypePrivate {
 		accessLevel = "private"
@@ -219,10 +236,7 @@ func (c *Client) PutObject(
 
 	// Start the multipart writer in a goroutine
 	go func() {
-		// Any error here should be propagated to the HTTP side via CloseWithError.
 		defer func() {
-			// Close the multipart writer first (writes final boundary),
-			// then close the pipe writer.
 			_ = writer.Close()
 			_ = pw.Close()
 		}()
@@ -255,8 +269,10 @@ func (c *Client) PutObject(
 		}
 
 		fileHeader := textproto.MIMEHeader{}
-		fileHeader.Set("Content-Disposition",
-			fmt.Sprintf(`form-data; name="%s"; filename="%s"`, "data", objectName))
+		fileHeader.Set(
+			"Content-Disposition",
+			fmt.Sprintf(`form-data; name="%s"; filename="%s"`, "data", objectName),
+		)
 		fileHeader.Set("Content-Type", contentType)
 
 		part, err := writer.CreatePart(fileHeader)
@@ -292,7 +308,7 @@ func (c *Client) PutObject(
 	// Get authorization from headers
 	authorization := strings.TrimSpace(req.Header.Get(headerAuthorization))
 	if authorization == "" {
-		return UploadInfo{}, errors.New("authorization header is required")
+		return UploadInfo{}, errors.New("filesdk: authorization header is required")
 	}
 
 	// Verify authorization
@@ -333,9 +349,33 @@ func (c *Client) PutObject(
 		return UploadInfo{}, fmt.Errorf("filesdk: upload failed: status=%d body=%s", resp.StatusCode, string(body))
 	}
 
+	// Decode upload response first to get CID
 	var uploadResp UploadInfo
 	if err := json.NewDecoder(resp.Body).Decode(&uploadResp); err != nil {
 		return UploadInfo{}, fmt.Errorf("filesdk: failed to decode response: %w", err)
+	}
+
+	// Create owner file credential if we have a CID and schema configured
+	if uploadResp.CID != "" {
+		// use default or options
+		accessibleSchemaID := options.accessibleSchemaID
+		if accessibleSchemaID == "" {
+			accessibleSchemaID = c.accessibleSchemaID
+		}
+
+		pilaAuthURL := options.pilaAuthURL
+		if pilaAuthURL == "" {
+			pilaAuthURL = c.pilaAuthURL
+		}
+
+		credential.SetAccessibleSchemaID(accessibleSchemaID)
+		credential.SetPilaAuthURL(pilaAuthURL)
+
+		ownerVCJWT, err := credential.CreateOwnerFileCredential(ctx, uploadResp.CID, options.issuerDID, bucketName, capsuleHex)
+		if err != nil {
+			return UploadInfo{}, fmt.Errorf("filesdk: failed to create owner file credential: %w", err)
+		}
+		uploadResp.OwnerVCJWT = ownerVCJWT
 	}
 
 	return uploadResp, nil

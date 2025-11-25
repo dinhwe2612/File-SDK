@@ -31,12 +31,14 @@ type Resolver interface {
 // It does not attempt to replicate the full AWS S3 protocol, but provides a custom implementation skeleton
 // that allows you to inject custom logic for signing, authentication, encryption, etc.
 type Client struct {
-	endpoint      *url.URL
-	httpClient    *http.Client
-	defaultHdrs   http.Header
-	cryptProvider crypt.Provider
-	resolver      Resolver
-	authClient    auth.Auth
+	endpoint           *url.URL
+	httpClient         *http.Client
+	defaultHdrs        http.Header
+	cryptProvider      crypt.Provider
+	resolver           Resolver
+	authClient         auth.Auth
+	accessibleSchemaID string
+	pilaAuthURL        string
 }
 
 const (
@@ -65,6 +67,10 @@ type Config struct {
 	Resolver Resolver
 	// Auth
 	Auth auth.Auth
+	// Accessible schema ID for owner file credentials.
+	AccessibleSchemaID string
+	// Pila auth URL for creating owner file credentials.
+	PilaAuthURL string
 }
 
 // New creates a Client.
@@ -121,12 +127,14 @@ func New(cfg Config) (*Client, error) {
 	}
 
 	return &Client{
-		endpoint:      u,
-		httpClient:    httpClient,
-		defaultHdrs:   defaultHdrs,
-		cryptProvider: cryptProv,
-		resolver:      cfg.Resolver,
-		authClient:    cfg.Auth,
+		endpoint:           u,
+		httpClient:         httpClient,
+		defaultHdrs:        defaultHdrs,
+		cryptProvider:      cryptProv,
+		resolver:           cfg.Resolver,
+		authClient:         cfg.Auth,
+		accessibleSchemaID: cfg.AccessibleSchemaID,
+		pilaAuthURL:        cfg.PilaAuthURL,
 	}, nil
 }
 
