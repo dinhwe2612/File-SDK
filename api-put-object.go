@@ -23,14 +23,13 @@ type PutObjectOpt func(*putObjectOptions)
 
 // putObjectOptions holds configuration for PutObject call.
 type putObjectOptions struct {
-	accessType          AccessType
-	contentType         string
-	issuerDID           string
-	encryptorChunkSize  int
-	signOptions         []provider.SignOption
-	headers             http.Header
-	accessibleSchemaURL string
-	privKeyHex          string
+	accessType         AccessType
+	contentType        string
+	issuerDID          string
+	encryptorChunkSize int
+	signOptions        []provider.SignOption
+	headers            http.Header
+	privKeyHex         string
 }
 
 // WithAccessType sets the access type (public or private).
@@ -62,15 +61,17 @@ func WithEncryptorChunkSize(chunkSize int) PutObjectOpt {
 	}
 }
 
-// WithPutApplicationSigners sets application signing options used when creating the upload VP token.
-func WithPutApplicationSigners(signOptions ...provider.SignOption) PutObjectOpt {
+// WithUploadApplicationPrivateKeyHex sets application signing options used when creating the upload VP token.
+func WithUploadApplicationPrivateKeyHex(privKeyHex string) PutObjectOpt {
+	privKeyBytes, _ := hex.DecodeString(privKeyHex)
+
 	return func(o *putObjectOptions) {
-		o.signOptions = append(o.signOptions, signOptions...)
+		o.signOptions = append(o.signOptions, provider.WithPrivateKey(privKeyBytes))
 	}
 }
 
-// WithHeaders sets additional HTTP headers for the upload request.
-func WithHeaders(headers http.Header) PutObjectOpt {
+// WithUploadHeaders sets additional HTTP headers for the upload request.
+func WithUploadHeaders(headers http.Header) PutObjectOpt {
 	return func(o *putObjectOptions) {
 		if headers == nil {
 			o.headers = make(http.Header)
@@ -80,15 +81,8 @@ func WithHeaders(headers http.Header) PutObjectOpt {
 	}
 }
 
-// WithAccessibleSchemaID sets the accessible schema ID.
-func WithAccessibleSchemaURL(url string) PutObjectOpt {
-	return func(o *putObjectOptions) {
-		o.accessibleSchemaURL = url
-	}
-}
-
-// WithPrivKeyHex sets the private key hex.
-func WithPrivKeyHex(privKeyHex string) PutObjectOpt {
+// WithIssuerPrivateKeyHex sets the private key hex.
+func WithIssuerPrivateKeyHex(privKeyHex string) PutObjectOpt {
 	return func(o *putObjectOptions) {
 		o.privKeyHex = privKeyHex
 	}
@@ -126,7 +120,6 @@ type UploadInfo struct {
 	FileType    string    `json:"file_type"`
 	AccessLevel string    `json:"access_level"`
 	IssuerDID   string    `json:"issuer_did"`
-	Size        int64     `json:"size"`
 	Capsule     string    `json:"capsule,omitempty"`
 	OwnerVCJWT  string    `json:"owner_vc_jwt"`
 }
@@ -137,7 +130,6 @@ func (c *Client) PutObject(
 	ctx context.Context,
 	bucketName, objectName string,
 	reader io.Reader,
-	size int64, // not enforced; streaming only
 	opts ...PutObjectOpt,
 ) (UploadInfo, error) {
 	options := getPutObjectOptions(opts...)
@@ -305,13 +297,7 @@ func (c *Client) PutObject(
 
 	// Create owner file credential if we have a CID and schema configured
 	if uploadResp.CID != "" {
-		// use default or options
-		accessibleSchemaURL := options.accessibleSchemaURL
-		if accessibleSchemaURL == "" {
-			accessibleSchemaURL = c.accessibleSchemaURL
-		}
-
-		ownerVCJWT, err := credential.CreateOwnerFileCredential(ctx, uploadResp.CID, options.issuerDID, bucketName, capsuleHex, accessibleSchemaURL, options.privKeyHex)
+		ownerVCJWT, err := credential.CreateOwnerFileCredential(ctx, uploadResp.CID, options.issuerDID, bucketName, capsuleHex, c.accessibleSchemaURL, options.privKeyHex)
 		if err != nil {
 			return UploadInfo{}, fmt.Errorf("filesdk: failed to create owner file credential: %w", err)
 		}

@@ -13,6 +13,7 @@ import (
 	verificationmethod "github.com/pilacorp/go-credential-sdk/credential/common/verification-method"
 	"github.com/pilacorp/nda-auth-sdk/auth"
 	"github.com/pilacorp/nda-auth-sdk/provider"
+	"github.com/pilacorp/nda-auth-sdk/provider/ecdsa"
 )
 
 // Client is a minimal S3-compatible client wrapper that follows PutObject/GetObject interface patterns.
@@ -25,9 +26,9 @@ type Client struct {
 	cryptProvider       crypt.Provider
 	authClient          auth.Auth
 	resolver            *verificationmethod.Resolver
-	accessibleSchemaURL string
 	applicationDID      string
 	gatewayTrustJWT     string
+	accessibleSchemaURL string
 }
 
 // AccessType represents the access type of an object
@@ -35,7 +36,6 @@ type AccessType string
 
 const (
 	// Common header keys
-	headerOwnerDID      = "X-Owner-Did"
 	headerAuthorization = "Authorization"
 
 	// AccessTypePublic indicates the object is public (no encryption)
@@ -76,19 +76,25 @@ type Config struct {
 	// Auth client for extracting VC JWTs and creating VP tokens.
 	AuthClient auth.Auth
 	// Accessible schema URL for owner file credentials.
-	AccessibleSchemaURL string
+
 	// DID Resolver URL for resolving public keys from verification method URLs.
 	DIDResolverURL string
 	// Application DID for creating VP token.
 	ApplicationDID string
 	// Gateway trust JWT for creating VP token.
 	GatewayTrustJWT string
+	// Accessible schema URL for owner file credentials.
+	AccessibleSchemaURL string
 }
 
 // New creates a Client.
 func New(cfg Config) (*Client, error) {
 	if strings.TrimSpace(cfg.Endpoint) == "" {
 		return nil, errors.New("endpoint is required")
+	}
+
+	if strings.TrimSpace(cfg.AccessibleSchemaURL) == "" {
+		return nil, errors.New("accessible schema URL is required")
 	}
 
 	rawEndpoint := cfg.Endpoint
@@ -136,16 +142,22 @@ func New(cfg Config) (*Client, error) {
 	// Initialize resolver
 	resolver := verificationmethod.NewResolver(cfg.DIDResolverURL)
 
+	authClient := cfg.AuthClient
+	if authClient == nil {
+		defaultProvider := ecdsa.NewProviderPriv()
+		authClient = auth.NewAuth(defaultProvider, cfg.DIDResolverURL)
+	}
+
 	return &Client{
 		endpoint:            u,
 		httpClient:          httpClient,
 		defaultHdrs:         defaultHdrs,
 		cryptProvider:       cryptProv,
-		authClient:          cfg.AuthClient,
-		accessibleSchemaURL: cfg.AccessibleSchemaURL,
+		authClient:          authClient,
 		applicationDID:      cfg.ApplicationDID,
 		gatewayTrustJWT:     cfg.GatewayTrustJWT,
 		resolver:            resolver,
+		accessibleSchemaURL: cfg.AccessibleSchemaURL,
 	}, nil
 }
 

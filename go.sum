@@ -15,8 +15,8 @@ github.com/holiman/uint256 v1.3.2 h1:a9EgMPSC1AAaj1SZL5zIQD3WbwTuHrMGOerLjGmM/TA
 github.com/holiman/uint256 v1.3.2/go.mod h1:EOMSn4q6Nyt9P6efbI3bueV4e1b3dGlUCXeiRV4ng7E=
 github.com/pilacorp/go-credential-sdk v1.3.0 h1:HL8ag41HFBG0ghnn+bsmpdUW3t5oe94lFHhdFbGgKLI=
 github.com/pilacorp/go-credential-sdk v1.3.0/go.mod h1:dVkFH++ip2Hwh1AHnOBiaJf7oqYusxUEdDzcOLrzbjQ=
-github.com/pilacorp/nda-auth-sdk v0.1.2 h1:fxr53trgvUFpwehYW3m1IOiEKHGl+9ldsheg4CA522M=
-github.com/pilacorp/nda-auth-sdk v0.1.2/go.mod h1:nIuaT1RyIlMG4c0bepk0zkce5PbPoyfvOpn1IdMCBjs=
+github.com/pilacorp/nda-auth-sdk v0.1.3 h1:5CoLfkWf89r6Kj2sOOOUC/3QpwKpfv+m7cKcubcx9cw=
+github.com/pilacorp/nda-auth-sdk v0.1.3/go.mod h1:nIuaT1RyIlMG4c0bepk0zkce5PbPoyfvOpn1IdMCBjs=
 github.com/pilacorp/nda-reencryption-sdk v1.0.9 h1:yI9o5enh6wjJzC6bwCapeH4USwqaC6qkK8YdadleoGY=
 github.com/pilacorp/nda-reencryption-sdk v1.0.9/go.mod h1:zEHZyRKs/SQ4EtVCS0oPlm9bZTIVw3wE+kt6EZsc56M=
 github.com/piprate/json-gold v0.7.0 h1:bEMirgA5y8Z2loTQfxyIFfY+EflxH1CTP6r/KIlcJNw=

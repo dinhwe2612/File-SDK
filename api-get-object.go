@@ -2,6 +2,7 @@ package filesdk
 
 import (
 	"context"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -23,8 +24,8 @@ type getObjectOptions struct {
 	signOptions  []provider.SignOption
 }
 
-// WithGetHeaders sets custom HTTP headers for the request.
-func WithGetHeaders(headers http.Header) GetObjectOpt {
+// WithDownloadHeaders sets custom HTTP headers for the request.
+func WithDownloadHeaders(headers http.Header) GetObjectOpt {
 	return func(o *getObjectOptions) {
 		// Defensive copy to avoid caller mutating after the fact
 		if headers == nil {
@@ -35,17 +36,19 @@ func WithGetHeaders(headers http.Header) GetObjectOpt {
 	}
 }
 
-// WithDecryptionProviderOptions sets PRE decryptor/provider options.
-func WithDecryptionProviderOptions(opts ...crypt.ProviderOpt) GetObjectOpt {
+// WithDecryptPrivateKeyHex sets PRE decryptor/provider options.
+func WithDecryptPrivateKeyHex(privKeyHex string) GetObjectOpt {
 	return func(o *getObjectOptions) {
-		o.providerOpts = append(o.providerOpts, opts...)
+		o.providerOpts = append(o.providerOpts, crypt.WithPrivateKeyHex(privKeyHex))
 	}
 }
 
-// WithGetApplicationSigners sets application signing options used when creating download VP tokens.
-func WithGetApplicationSigners(opts ...provider.SignOption) GetObjectOpt {
+// WithDownloadApplicationPrivateKeyHex sets application signing options used when creating download VP tokens.
+func WithDownloadApplicationPrivateKeyHex(privKeyHex string) GetObjectOpt {
+	privKeyBytes, _ := hex.DecodeString(privKeyHex)
+
 	return func(o *getObjectOptions) {
-		o.signOptions = append(o.signOptions, opts...)
+		o.signOptions = append(o.signOptions, provider.WithPrivateKey(privKeyBytes))
 	}
 }
 
@@ -82,7 +85,7 @@ type GetObjectResult struct {
 }
 
 // GetObject retrieves an object from storage.
-// bucketName represents the owner DID, objectName is the CID.
+// bucketName represents the viewerDID, objectName is the CID.
 // Returns a GetObjectResult containing the object data stream and metadata.
 // The caller must close the Body when done reading.
 func (c *Client) GetObject(
@@ -92,20 +95,17 @@ func (c *Client) GetObject(
 ) (*GetObjectResult, error) {
 	options := getGetObjectOptions(opts...)
 
-	if bucketName == "" {
-		return nil, errors.New("owner DID (bucketName) is required")
-	}
 	if objectName == "" {
-		return nil, errors.New("object name (CID) is required")
+		return nil, errors.New("filesdk: object name (CID) is required")
 	}
 	if c.applicationDID == "" {
-		return nil, errors.New("application DID is not configured")
+		return nil, errors.New("filesdk: application DID is not configured")
 	}
 	if c.gatewayTrustJWT == "" {
-		return nil, errors.New("gateway trust JWT is not configured")
+		return nil, errors.New("filesdk: gateway trust JWT is not configured")
 	}
 	if c.authClient == nil {
-		return nil, errors.New("auth client is not configured")
+		return nil, errors.New("filesdk: auth client is not configured")
 	}
 
 	// Build request & headers
@@ -120,15 +120,10 @@ func (c *Client) GetObject(
 	// Set headers
 	c.mergeHeaders(req.Header, options.headers)
 
-	// Ensure owner DID header is propagated if caller provided bucket
-	if req.Header.Get(headerOwnerDID) == "" {
-		req.Header.Set(headerOwnerDID, bucketName)
-	}
-
 	// Get authorization from headers
 	authorization := strings.TrimSpace(req.Header.Get(headerAuthorization))
 	if authorization == "" {
-		return nil, errors.New("authorization header is required")
+		return nil, errors.New("filesdk: authorization header is required")
 	}
 
 	vpToken, normalizedAuthorization, err := c.buildVPAuthorization(ctx, authorization, "", options.signOptions...)

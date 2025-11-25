@@ -20,7 +20,7 @@ type CreateCredentialPayload struct {
 
 // CreateOwnerFileCredential creates an accessible credential using the Pila auth service.
 func CreateOwnerFileCredential(
-	ctx context.Context,
+	_ context.Context,
 	cid string,
 	issuerDID string,
 	ownerDID string,

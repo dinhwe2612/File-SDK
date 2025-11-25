@@ -4,7 +4,7 @@ go 1.24.6
 
 require (
 	github.com/pilacorp/go-credential-sdk v1.3.0
-	github.com/pilacorp/nda-auth-sdk v0.1.2
+	github.com/pilacorp/nda-auth-sdk v0.1.3
 	github.com/pilacorp/nda-reencryption-sdk v1.0.9
 )
 

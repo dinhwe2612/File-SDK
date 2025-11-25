@@ -3,6 +3,7 @@ package filesdk
 import (
 	"context"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"time"
 
@@ -10,80 +11,155 @@ import (
 	pre "github.com/pilacorp/nda-reencryption-sdk/pre"
 )
 
-// GetAccessibleVCRequest represents the request of a GetAccessibleVC operation.
-type GetAccessibleVCRequest struct {
-	OwnerDID            string
-	ViewerDID           string
-	CID                 string
-	Capsule             string
-	AccessibleSchemaURL string
-	PrivKeyHex          string
+// PostAccessibleVCOpt configures PostAccessibleVC call options.
+type PostAccessibleVCOpt func(*postAccessibleVCOptions)
+
+// postAccessibleVCOptions holds configuration for PostAccessibleVC call.
+type postAccessibleVCOptions struct {
+	accessibleSchemaURL string
+	ownerPrivateKeyHex  string
+	role                string
+	permissions         []string
+	validFrom           time.Time
 }
 
-// PostAccessibleVC creates a new accessible VC for a given CID.
+// getPostAccessibleVCOptions applies functional options and sets defaults.
+func getPostAccessibleVCOptions(opts ...PostAccessibleVCOpt) *postAccessibleVCOptions {
+	o := &postAccessibleVCOptions{
+		// Defaults
+		role:        "viewer",
+		permissions: []string{"read"},
+		validFrom:   time.Now(),
+	}
+	for _, opt := range opts {
+		opt(o)
+	}
+	return o
+}
+
+// WithAccessibleSchemaURL sets the schema URL for the Accessible VC.
+func WithAccessibleSchemaURL(url string) PostAccessibleVCOpt {
+	return func(o *postAccessibleVCOptions) {
+		o.accessibleSchemaURL = url
+	}
+}
+
+// WithOwnerPrivateKeyHex sets the owner's private key (hex-encoded),
+// used to create the re-capsule and sign the VC.
+func WithOwnerPrivateKeyHex(hexKey string) PostAccessibleVCOpt {
+	return func(o *postAccessibleVCOptions) {
+		o.ownerPrivateKeyHex = hexKey
+	}
+}
+
+// WithDocumentRole customizes the "role" field in the VC subject.
+func WithDocumentRole(role string) PostAccessibleVCOpt {
+	return func(o *postAccessibleVCOptions) {
+		if role != "" {
+			o.role = role
+		}
+	}
+}
+
+// WithPermissions customizes the permissions list for the VC.
+func WithPermissions(perms ...string) PostAccessibleVCOpt {
+	return func(o *postAccessibleVCOptions) {
+		if len(perms) > 0 {
+			o.permissions = perms
+		}
+	}
+}
+
+// WithAccessibleValidFrom overrides the ValidFrom timestamp of the VC.
+func WithAccessibleValidFrom(t time.Time) PostAccessibleVCOpt {
+	return func(o *postAccessibleVCOptions) {
+		if !t.IsZero() {
+			o.validFrom = t
+		}
+	}
+}
+
 func (c *Client) PostAccessibleVC(
 	ctx context.Context,
-	request GetAccessibleVCRequest,
+	ownerDID, viewerDID, cid, capsule string,
+	opts ...PostAccessibleVCOpt,
 ) (string, error) {
-	// Create re-capsule
-	capsuleBytes, err := hex.DecodeString(request.Capsule)
+	_ = ctx // currently unused, but kept for future-proofing / symmetry
+
+	options := getPostAccessibleVCOptions(opts...)
+
+	if options.ownerPrivateKeyHex == "" {
+		return "", errors.New("filesdk: owner private key hex is required (use WithOwnerPrivateKeyHex)")
+	}
+	if options.accessibleSchemaURL == "" {
+		return "", errors.New("filesdk: accessible schema URL is required (use WithAccessibleSchemaURL)")
+	}
+
+	// 1. Decode capsule
+	capsuleBytes, err := hex.DecodeString(capsule)
 	if err != nil {
 		return "", fmt.Errorf("filesdk: failed to decode capsule: %w", err)
 	}
 
-	// Get public key from DID resolver
-	publicKey, err := c.resolver.GetPublicKey(request.ViewerDID + "#key-1")
+	// 2. Get public key from DID resolver
+	publicKey, err := c.resolver.GetPublicKey(viewerDID + "#key-1")
 	if err != nil {
 		return "", fmt.Errorf("filesdk: failed to get public key: %w", err)
 	}
 
-	// Create re-capsule
-	reCapsule, err := pre.CreateReCapsule(request.PrivKeyHex, publicKey, capsuleBytes)
+	// 3. Create re-capsule
+	reCapsule, err := pre.CreateReCapsule(options.ownerPrivateKeyHex, publicKey, capsuleBytes)
 	if err != nil {
 		return "", fmt.Errorf("filesdk: failed to create re-capsule: %w", err)
 	}
 	reCapsuleHex := hex.EncodeToString(reCapsule)
 
-	// Create payload for creating VC
+	// 4. Build VC payload
 	payloadCreateVC := vc.CredentialContents{
 		Context: []interface{}{"https://www.w3.org/ns/credentials/v2"},
-		Issuer:  request.OwnerDID,
+		Issuer:  ownerDID,
 		Subject: []vc.Subject{
 			{
-				ID: request.ViewerDID,
+				ID: viewerDID,
 				CustomFields: map[string]any{
-					"cid":         request.CID,
-					"role":        "viewer",
-					"permissions": []string{"read"},
+					"cid":         cid,
+					"role":        options.role,
+					"permissions": options.permissions,
 					"capsule":     reCapsuleHex,
 				},
 			},
 		},
 		Schemas: []vc.Schema{
 			{
-				ID:   request.AccessibleSchemaURL,
+				ID:   options.accessibleSchemaURL,
 				Type: "JsonSchema",
 			},
 		},
 		Types: []string{"VerifiableCredential", "DocumentAccessCredential"},
 	}
 
-	// Set valid_from to current time. VC has no valid_until.
-	validFrom := time.Now()
-	payloadCreateVC.ValidFrom = validFrom
+	// Valid from: configured (default: now). No validUntil.
+	payloadCreateVC.ValidFrom = options.validFrom
 
-	// Create VC using credential sdk
+	// 5. Create VC using credential SDK
 	vcJWT, err := vc.NewJWTCredential(payloadCreateVC)
 	if err != nil {
 		return "", fmt.Errorf("filesdk: failed to create VC: %w", err)
 	}
 
-	vcJWT.AddProof(request.PrivKeyHex)
+	if err := vcJWT.AddProof(options.ownerPrivateKeyHex); err != nil {
+		return "", fmt.Errorf("filesdk: failed to add proof: %w", err)
+	}
 
 	serializedVC, err := vcJWT.Serialize()
 	if err != nil {
 		return "", fmt.Errorf("filesdk: failed to serialize VC: %w", err)
 	}
 
-	return serializedVC.(string), nil
+	vcStr, ok := serializedVC.(string)
+	if !ok {
+		return "", fmt.Errorf("filesdk: serialized VC is not a string (type %T)", serializedVC)
+	}
+
+	return vcStr, nil
 }

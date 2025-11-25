@@ -6,7 +6,7 @@ replace github.com/dinhwe2612/file-sdk => ../
 
 require (
 	github.com/dinhwe2612/file-sdk v0.0.0-00010101000000-000000000000
-	github.com/pilacorp/go-credential-sdk v1.3.0
+	github.com/pilacorp/nda-auth-sdk v0.1.3
 )
 
 require (
@@ -15,7 +15,7 @@ require (
 	github.com/decred/dcrd/dcrec/secp256k1/v4 v4.0.1 // indirect
 	github.com/ethereum/go-ethereum v1.16.7 // indirect
 	github.com/holiman/uint256 v1.3.2 // indirect
-	github.com/pilacorp/nda-auth-sdk v0.1.2 // indirect
+	github.com/pilacorp/go-credential-sdk v1.3.0 // indirect
 	github.com/pilacorp/nda-reencryption-sdk v1.0.9 // indirect
 	github.com/piprate/json-gold v0.7.0 // indirect
 	github.com/pquerna/cachecontrol v0.0.0-20180517163645-1555304b9b35 // indirect
