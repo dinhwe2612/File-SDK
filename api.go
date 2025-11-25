@@ -9,7 +9,18 @@ import (
 	"time"
 
 	"github.com/dinhwe2612/file-sdk/pkg/crypt"
+	"github.com/pilacorp/nda-auth-sdk/auth"
 )
+
+var applicationDID, gatewayTrustJWT string
+
+func SetApplicationDID(did string) {
+	applicationDID = did
+}
+
+func SetGatewayTrustJWT(jwt string) {
+	gatewayTrustJWT = jwt
+}
 
 // Resolver interface for resolving public keys from verification method URLs
 type Resolver interface {
@@ -25,6 +36,7 @@ type Client struct {
 	defaultHdrs   http.Header
 	cryptProvider crypt.Provider
 	resolver      Resolver
+	authClient    auth.Auth
 }
 
 const (
@@ -51,6 +63,8 @@ type Config struct {
 	// Resolver is required for resolving public keys from verification method URLs.
 	// Used for private file uploads to encrypt data.
 	Resolver Resolver
+	// Auth
+	Auth auth.Auth
 }
 
 // New creates a Client.
@@ -112,6 +126,7 @@ func New(cfg Config) (*Client, error) {
 		defaultHdrs:   defaultHdrs,
 		cryptProvider: cryptProv,
 		resolver:      cfg.Resolver,
+		authClient:    cfg.Auth,
 	}, nil
 }
 
