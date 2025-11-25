@@ -13,12 +13,6 @@ import (
 	"github.com/pilacorp/nda-auth-sdk/provider"
 )
 
-// Common header keys
-const (
-	headerOwnerDID      = "X-Owner-Did"
-	headerAuthorization = "Authorization"
-)
-
 // GetObjectOpt configures GetObject call options.
 type GetObjectOpt func(*getObjectOptions)
 
@@ -96,24 +90,25 @@ func (c *Client) GetObject(
 	bucketName, objectName string,
 	opts ...GetObjectOpt,
 ) (*GetObjectResult, error) {
+	options := getGetObjectOptions(opts...)
+
 	if bucketName == "" {
 		return nil, errors.New("owner DID (bucketName) is required")
 	}
 	if objectName == "" {
 		return nil, errors.New("object name (CID) is required")
 	}
+	if c.applicationDID == "" {
+		return nil, errors.New("application DID is not configured")
+	}
+	if c.gatewayTrustJWT == "" {
+		return nil, errors.New("gateway trust JWT is not configured")
+	}
 	if c.authClient == nil {
 		return nil, errors.New("auth client is not configured")
 	}
-	if applicationDID == "" {
-		return nil, errors.New("application DID is not configured (use SetApplicationDID)")
-	}
-	if gatewayTrustJWT == "" {
-		return nil, errors.New("gateway trust JWT is not configured (use SetGatewayTrustJWT)")
-	}
 
-	// Build URL for file endpoint - objectName (CID) is used as path parameter.
-	// The endpoint already includes /api/v1, so we just append /files/{cid}.
+	// Build request & headers
 	targetURL := fmt.Sprintf("%s/files/%s", c.endpoint.String(), objectName)
 
 	// Create request
@@ -121,9 +116,6 @@ func (c *Client) GetObject(
 	if err != nil {
 		return nil, fmt.Errorf("filesdk: failed to create request: %w", err)
 	}
-
-	// Parse options
-	options := getGetObjectOptions(opts...)
 
 	// Set headers
 	c.mergeHeaders(req.Header, options.headers)
@@ -133,30 +125,16 @@ func (c *Client) GetObject(
 		req.Header.Set(headerOwnerDID, bucketName)
 	}
 
-	// Capture caller-provided Authorization header before we overwrite it
-	rawAuthorization := strings.TrimSpace(req.Header.Get(headerAuthorization))
-	if rawAuthorization == "" {
+	// Get authorization from headers
+	authorization := strings.TrimSpace(req.Header.Get(headerAuthorization))
+	if authorization == "" {
 		return nil, errors.New("authorization header is required")
 	}
 
-	// Verify authorization
-	_, _, vcJWTs, err := c.authClient.VerifyToken(ctx, rawAuthorization)
+	vpToken, normalizedAuthorization, err := c.buildVPAuthorization(ctx, authorization, "", options.signOptions...)
 	if err != nil {
-		return nil, fmt.Errorf("filesdk: failed to verify authorization: %w", err)
+		return nil, fmt.Errorf("filesdk: failed to build VP authorization: %w", err)
 	}
-
-	// Append VC JWTs to headers
-	vcJWTs = append(vcJWTs, gatewayTrustJWT)
-
-	// Create VP token
-	vpToken, err := c.authClient.CreateToken(ctx, vcJWTs, applicationDID, options.signOptions...)
-	if err != nil {
-		return nil, fmt.Errorf("filesdk: failed to create VP token: %w", err)
-	}
-
-	// Some implementations may return the token with surrounding quotes; normalize it.
-	vpToken = strings.TrimSpace(vpToken)
-	vpToken = strings.Trim(vpToken, `"`)
 
 	req.Header.Set(headerAuthorization, vpToken)
 
@@ -175,7 +153,6 @@ func (c *Client) GetObject(
 	}()
 
 	if resp.StatusCode >= http.StatusBadRequest {
-		// Optional: could read and include response body snippet for easier debugging
 		return nil, fmt.Errorf("filesdk: get object failed: status=%d", resp.StatusCode)
 	}
 
@@ -188,22 +165,17 @@ func (c *Client) GetObject(
 	}
 
 	// Extract capsule from *original* bearer token to detect private objects.
-	capsule, capErr := credential.CapsuleFromJWT(rawAuthorization)
+	capsule, capErr := credential.CapsuleFromJWT(normalizedAuthorization)
 	if capErr != nil {
 		// We treat failure to extract capsule as "no capsule" → public object.
 		capsule = ""
 	}
-	isPrivate := capsule != ""
 
 	// Default reader: raw response body
 	var reader io.ReadCloser = respBody
 
 	// If object is private and we have a capsule, decrypt
-	if isPrivate {
-		if len(options.providerOpts) == 0 {
-			return nil, errors.New("provider options are required for private objects (use WithProviderOpts)")
-		}
-
+	if capsule != "" {
 		// Get decryptor from provider
 		decryptor, err := c.cryptProvider.NewPreDecryptor(ctx, capsule, options.providerOpts...)
 		if err != nil {
@@ -224,13 +196,10 @@ func (c *Client) GetObject(
 		}(respBody)
 
 		reader = pipeReader
-
-		// We hand off responsibility for closing respBody to the goroutine above.
-		shouldCloseBody = false
-	} else {
-		// For public objects, caller takes ownership of closing resp.Body
-		shouldCloseBody = false
 	}
+
+	// Don't close body here, let the caller close it
+	shouldCloseBody = false
 
 	return &GetObjectResult{
 		Body: reader,

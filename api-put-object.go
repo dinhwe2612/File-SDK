@@ -18,38 +18,19 @@ import (
 	pre "github.com/pilacorp/nda-reencryption-sdk/pre"
 )
 
-// AccessType represents the access type of an object
-type AccessType string
-
-const (
-	// AccessTypePublic indicates the object is public (no encryption)
-	AccessTypePublic AccessType = "public"
-	// AccessTypePrivate indicates the object is private (encrypted)
-	AccessTypePrivate AccessType = "private"
-
-	// copyBufferSize is the buffer size used for copying data to multipart form.
-	// 64KB is a good balance between memory usage and performance for file uploads.
-	copyBufferSize = 64 * 1024
-
-	// encryptorChunkSize is the chunk size used for PRE encryption.
-	// 1MB chunk size provides good performance for encrypted file uploads.
-	encryptorChunkSize = 1 << 20 // 1MB
-)
-
 // PutObjectOpt configures PutObject call options.
 type PutObjectOpt func(*putObjectOptions)
 
 // putObjectOptions holds configuration for PutObject call.
 type putObjectOptions struct {
-	accessType         AccessType
-	contentType        string
-	issuerDID          string
-	verificationMethod string
-	encryptorChunkSize int
-	signOptions        []provider.SignOption
-	headers            http.Header
-	accessibleSchemaID string
-	pilaAuthURL        string
+	accessType          AccessType
+	contentType         string
+	issuerDID           string
+	encryptorChunkSize  int
+	signOptions         []provider.SignOption
+	headers             http.Header
+	accessibleSchemaURL string
+	privKeyHex          string
 }
 
 // WithAccessType sets the access type (public or private).
@@ -70,14 +51,6 @@ func WithContentType(contentType string) PutObjectOpt {
 func WithIssuerDID(issuerDID string) PutObjectOpt {
 	return func(o *putObjectOptions) {
 		o.issuerDID = issuerDID
-	}
-}
-
-// WithVerificationMethod sets the verification method URL (e.g., "did:example:123#key-1").
-// If not provided, defaults to "<ownerDID>#key-1".
-func WithVerificationMethod(verificationMethod string) PutObjectOpt {
-	return func(o *putObjectOptions) {
-		o.verificationMethod = verificationMethod
 	}
 }
 
@@ -108,16 +81,16 @@ func WithHeaders(headers http.Header) PutObjectOpt {
 }
 
 // WithAccessibleSchemaID sets the accessible schema ID.
-func WithAccessibleSchemaID(id string) PutObjectOpt {
+func WithAccessibleSchemaURL(url string) PutObjectOpt {
 	return func(o *putObjectOptions) {
-		o.accessibleSchemaID = id
+		o.accessibleSchemaURL = url
 	}
 }
 
-// WithPilaAuthURL sets the Pila auth URL.
-func WithPilaAuthURL(url string) PutObjectOpt {
+// WithPrivKeyHex sets the private key hex.
+func WithPrivKeyHex(privKeyHex string) PutObjectOpt {
 	return func(o *putObjectOptions) {
-		o.pilaAuthURL = url
+		o.privKeyHex = privKeyHex
 	}
 }
 
@@ -127,10 +100,10 @@ func getPutObjectOptions(opts ...PutObjectOpt) *putObjectOptions {
 		accessType:         AccessTypePublic,
 		contentType:        "",
 		issuerDID:          "",
-		verificationMethod: "",
 		encryptorChunkSize: encryptorChunkSize,
 		signOptions:        nil,
 		headers:            nil,
+		privKeyHex:         "",
 	}
 
 	for _, opt := range opts {
@@ -167,22 +140,22 @@ func (c *Client) PutObject(
 	size int64, // not enforced; streaming only
 	opts ...PutObjectOpt,
 ) (UploadInfo, error) {
+	options := getPutObjectOptions(opts...)
+
 	if bucketName == "" {
 		return UploadInfo{}, errors.New("filesdk: owner DID (bucketName) is required")
-	}
-
-	options := getPutObjectOptions(opts...)
-	if options.issuerDID == "" {
-		return UploadInfo{}, errors.New("filesdk: issuer DID is required (use WithIssuerDID)")
 	}
 	if objectName == "" {
 		return UploadInfo{}, errors.New("filesdk: objectName is required")
 	}
-	if applicationDID == "" {
-		return UploadInfo{}, errors.New("filesdk: application DID is not configured (use SetApplicationDID)")
+	if options.issuerDID == "" {
+		return UploadInfo{}, errors.New("filesdk: issuer DID is required (use WithIssuerDID)")
 	}
-	if gatewayTrustJWT == "" {
-		return UploadInfo{}, errors.New("filesdk: gateway trust JWT is not configured (use SetGatewayTrustJWT)")
+	if c.applicationDID == "" {
+		return UploadInfo{}, errors.New("filesdk: application DID is not configured")
+	}
+	if c.gatewayTrustJWT == "" {
+		return UploadInfo{}, errors.New("filesdk: gateway trust JWT is not configured")
 	}
 
 	// Determine access level from AccessType.
@@ -197,10 +170,6 @@ func (c *Client) PutObject(
 
 	if options.accessType == AccessTypePrivate {
 		verificationMethod := bucketName + "#key-1"
-		if options.verificationMethod != "" {
-			verificationMethod = options.verificationMethod
-		}
-
 		publicKeyHex, err := c.resolver.GetPublicKey(verificationMethod)
 		if err != nil {
 			return UploadInfo{}, fmt.Errorf("filesdk: failed to get public key from resolver: %w", err)
@@ -291,19 +260,17 @@ func (c *Client) PutObject(
 	// Build request & headers
 	targetURL := fmt.Sprintf("%s/files/upload", c.endpoint.String())
 
+	// Create request
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, targetURL, pr)
 	if err != nil {
 		return UploadInfo{}, fmt.Errorf("filesdk: failed to create request: %w", err)
 	}
 
-	req.Header.Set("Content-Type", writer.FormDataContentType())
+	// Set headers
+	c.mergeHeaders(req.Header, options.headers)
 
-	// Apply caller headers first (including their original Authorization)
-	for key, values := range options.headers {
-		for _, v := range values {
-			req.Header.Add(key, v)
-		}
-	}
+	// Set content type
+	req.Header.Set("Content-Type", writer.FormDataContentType())
 
 	// Get authorization from headers
 	authorization := strings.TrimSpace(req.Header.Get(headerAuthorization))
@@ -311,29 +278,10 @@ func (c *Client) PutObject(
 		return UploadInfo{}, errors.New("filesdk: authorization header is required")
 	}
 
-	// Verify authorization
-	_, requester, vcJWTs, err := c.authClient.VerifyToken(ctx, authorization)
+	vpToken, _, err := c.buildVPAuthorization(ctx, authorization, options.issuerDID, options.signOptions...)
 	if err != nil {
-		return UploadInfo{}, fmt.Errorf("filesdk: failed to verify authorization: %w", err)
+		return UploadInfo{}, fmt.Errorf("filesdk: failed to build VP authorization: %w", err)
 	}
-	if requester != options.issuerDID {
-		return UploadInfo{}, fmt.Errorf(
-			"filesdk: requester DID %q does not match issuer DID %q",
-			requester, options.issuerDID,
-		)
-	}
-
-	// Append VC JWTs with gateway trust
-	vcJWTs = append(vcJWTs, gatewayTrustJWT)
-
-	// Create VP token
-	vpToken, err := c.authClient.CreateToken(ctx, vcJWTs, applicationDID, options.signOptions...)
-	if err != nil {
-		return UploadInfo{}, fmt.Errorf("filesdk: failed to create VP token: %w", err)
-	}
-
-	vpToken = strings.TrimSpace(vpToken)
-	vpToken = strings.Trim(vpToken, `"`)
 
 	req.Header.Set(headerAuthorization, vpToken)
 
@@ -358,20 +306,12 @@ func (c *Client) PutObject(
 	// Create owner file credential if we have a CID and schema configured
 	if uploadResp.CID != "" {
 		// use default or options
-		accessibleSchemaID := options.accessibleSchemaID
-		if accessibleSchemaID == "" {
-			accessibleSchemaID = c.accessibleSchemaID
+		accessibleSchemaURL := options.accessibleSchemaURL
+		if accessibleSchemaURL == "" {
+			accessibleSchemaURL = c.accessibleSchemaURL
 		}
 
-		pilaAuthURL := options.pilaAuthURL
-		if pilaAuthURL == "" {
-			pilaAuthURL = c.pilaAuthURL
-		}
-
-		credential.SetAccessibleSchemaID(accessibleSchemaID)
-		credential.SetPilaAuthURL(pilaAuthURL)
-
-		ownerVCJWT, err := credential.CreateOwnerFileCredential(ctx, uploadResp.CID, options.issuerDID, bucketName, capsuleHex)
+		ownerVCJWT, err := credential.CreateOwnerFileCredential(ctx, uploadResp.CID, options.issuerDID, bucketName, capsuleHex, accessibleSchemaURL, options.privKeyHex)
 		if err != nil {
 			return UploadInfo{}, fmt.Errorf("filesdk: failed to create owner file credential: %w", err)
 		}

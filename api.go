@@ -1,6 +1,7 @@
 package filesdk
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net/http"
@@ -9,41 +10,51 @@ import (
 	"time"
 
 	"github.com/dinhwe2612/file-sdk/pkg/crypt"
+	verificationmethod "github.com/pilacorp/go-credential-sdk/credential/common/verification-method"
 	"github.com/pilacorp/nda-auth-sdk/auth"
+	"github.com/pilacorp/nda-auth-sdk/provider"
 )
-
-var applicationDID, gatewayTrustJWT string
-
-func SetApplicationDID(did string) {
-	applicationDID = did
-}
-
-func SetGatewayTrustJWT(jwt string) {
-	gatewayTrustJWT = jwt
-}
-
-// Resolver interface for resolving public keys from verification method URLs
-type Resolver interface {
-	GetPublicKey(verificationMethodURL string) (string, error)
-}
 
 // Client is a minimal S3-compatible client wrapper that follows PutObject/GetObject interface patterns.
 // It does not attempt to replicate the full AWS S3 protocol, but provides a custom implementation skeleton
 // that allows you to inject custom logic for signing, authentication, encryption, etc.
 type Client struct {
-	endpoint           *url.URL
-	httpClient         *http.Client
-	defaultHdrs        http.Header
-	cryptProvider      crypt.Provider
-	resolver           Resolver
-	authClient         auth.Auth
-	accessibleSchemaID string
-	pilaAuthURL        string
+	endpoint            *url.URL
+	httpClient          *http.Client
+	defaultHdrs         http.Header
+	cryptProvider       crypt.Provider
+	authClient          auth.Auth
+	resolver            *verificationmethod.Resolver
+	accessibleSchemaURL string
+	applicationDID      string
+	gatewayTrustJWT     string
 }
 
+// AccessType represents the access type of an object
+type AccessType string
+
 const (
+	// Common header keys
+	headerOwnerDID      = "X-Owner-Did"
+	headerAuthorization = "Authorization"
+
+	// AccessTypePublic indicates the object is public (no encryption)
+	AccessTypePublic AccessType = "public"
+
+	// AccessTypePrivate indicates the object is private (encrypted)
+	AccessTypePrivate AccessType = "private"
+
+	// copyBufferSize is the buffer size used for copying data to multipart form.
+	// 64KB is a good balance between memory usage and performance for file uploads.
+	copyBufferSize = 64 * 1024
+
+	// encryptorChunkSize is the chunk size used for PRE encryption.
+	// 1MB chunk size provides good performance for encrypted file uploads.
+	encryptorChunkSize = 1 << 20 // 1MB
+
 	// defaultHTTPTimeout is used when Config.Timeout is zero or negative.
 	defaultHTTPTimeout = 30 * time.Second
+
 	// maxErrorBodyBytes is the maximum number of bytes to read from the error response body.
 	maxErrorBodyBytes = 1 << 20
 )
@@ -62,15 +73,16 @@ type Config struct {
 	// CryptProvider allows customizing how decryptors are constructed for private downloads.
 	// If nil, a DefaultProvider (using OwnerPrivateKeyHex) is used.
 	CryptProvider crypt.Provider
-	// Resolver is required for resolving public keys from verification method URLs.
-	// Used for private file uploads to encrypt data.
-	Resolver Resolver
-	// Auth
-	Auth auth.Auth
-	// Accessible schema ID for owner file credentials.
-	AccessibleSchemaID string
-	// Pila auth URL for creating owner file credentials.
-	PilaAuthURL string
+	// Auth client for extracting VC JWTs and creating VP tokens.
+	AuthClient auth.Auth
+	// Accessible schema URL for owner file credentials.
+	AccessibleSchemaURL string
+	// DID Resolver URL for resolving public keys from verification method URLs.
+	DIDResolverURL string
+	// Application DID for creating VP token.
+	ApplicationDID string
+	// Gateway trust JWT for creating VP token.
+	GatewayTrustJWT string
 }
 
 // New creates a Client.
@@ -121,20 +133,19 @@ func New(cfg Config) (*Client, error) {
 		cryptProv = &crypt.DefaultProvider{}
 	}
 
-	// Validate resolver is provided
-	if cfg.Resolver == nil {
-		return nil, errors.New("resolver is required")
-	}
+	// Initialize resolver
+	resolver := verificationmethod.NewResolver(cfg.DIDResolverURL)
 
 	return &Client{
-		endpoint:           u,
-		httpClient:         httpClient,
-		defaultHdrs:        defaultHdrs,
-		cryptProvider:      cryptProv,
-		resolver:           cfg.Resolver,
-		authClient:         cfg.Auth,
-		accessibleSchemaID: cfg.AccessibleSchemaID,
-		pilaAuthURL:        cfg.PilaAuthURL,
+		endpoint:            u,
+		httpClient:          httpClient,
+		defaultHdrs:         defaultHdrs,
+		cryptProvider:       cryptProv,
+		authClient:          cfg.AuthClient,
+		accessibleSchemaURL: cfg.AccessibleSchemaURL,
+		applicationDID:      cfg.ApplicationDID,
+		gatewayTrustJWT:     cfg.GatewayTrustJWT,
+		resolver:            resolver,
 	}, nil
 }
 
@@ -162,4 +173,38 @@ func cloneHeader(src http.Header) http.Header {
 		out[k] = cp
 	}
 	return out
+}
+
+// buildVPAuthorization verifies the caller authorization header and produces a VP token.
+// It returns the new VP token along with the normalized caller authorization (used for capsule extraction).
+func (c *Client) buildVPAuthorization(
+	ctx context.Context,
+	rawAuthorization string,
+	expectedRequester string,
+	signOptions ...provider.SignOption,
+) (string, string, error) {
+	authorization := strings.TrimSpace(rawAuthorization)
+	if authorization == "" {
+		return "", "", errors.New("authorization header is required")
+	}
+
+	_, requester, vcJWTs, err := c.authClient.VerifyToken(ctx, authorization)
+	if err != nil {
+		return "", "", fmt.Errorf("filesdk: failed to verify authorization: %w", err)
+	}
+	if expectedRequester != "" && requester != expectedRequester {
+		return "", "", fmt.Errorf(
+			"filesdk: requester DID %q does not match issuer DID %q",
+			requester, expectedRequester,
+		)
+	}
+
+	vcJWTs = append(vcJWTs, c.gatewayTrustJWT)
+
+	vpToken, err := c.authClient.CreateToken(ctx, vcJWTs, c.applicationDID, signOptions...)
+	if err != nil {
+		return "", "", fmt.Errorf("filesdk: failed to create VP token: %w", err)
+	}
+
+	return vpToken, authorization, nil
 }
