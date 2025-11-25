@@ -62,8 +62,8 @@ func WithEncryptorChunkSize(chunkSize int) PutObjectOpt {
 	}
 }
 
-// WithSignOptions sets the sign options (appended, not replaced).
-func WithSignOptions(signOptions ...provider.SignOption) PutObjectOpt {
+// WithPutApplicationSigners sets application signing options used when creating the upload VP token.
+func WithPutApplicationSigners(signOptions ...provider.SignOption) PutObjectOpt {
 	return func(o *putObjectOptions) {
 		o.signOptions = append(o.signOptions, signOptions...)
 	}

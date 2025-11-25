@@ -35,15 +35,15 @@ func WithGetHeaders(headers http.Header) GetObjectOpt {
 	}
 }
 
-// WithProviderOpts sets the provider options for decryption.
-func WithProviderOpts(opts ...crypt.ProviderOpt) GetObjectOpt {
+// WithDecryptionProviderOptions sets PRE decryptor/provider options.
+func WithDecryptionProviderOptions(opts ...crypt.ProviderOpt) GetObjectOpt {
 	return func(o *getObjectOptions) {
 		o.providerOpts = append(o.providerOpts, opts...)
 	}
 }
 
-// WithGetObjectSignOptions sets custom sign options when creating VP token.
-func WithGetObjectSignOptions(opts ...provider.SignOption) GetObjectOpt {
+// WithGetApplicationSigners sets application signing options used when creating download VP tokens.
+func WithGetApplicationSigners(opts ...provider.SignOption) GetObjectOpt {
 	return func(o *getObjectOptions) {
 		o.signOptions = append(o.signOptions, opts...)
 	}
