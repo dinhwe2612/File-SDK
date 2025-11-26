@@ -73,10 +73,10 @@ func WithOwnerPrivKeyHex(privKeyHex string) PostAccessibleVCOpt {
 }
 
 type PostAccessibleVCInput struct {
-	OwnerDID  string
-	ViewerDID string
-	CID       string
-	Capsule   string
+	OwnerDID  *string
+	ViewerDID *string
+	CID       *string
+	Capsule   *string
 }
 
 type PostAccessibleVCOutput struct {
@@ -102,22 +102,22 @@ func (c *Client) PostAccessibleVC(
 	}
 
 	// Get Owner DID
-	if input.OwnerDID == "" {
+	if input.OwnerDID == nil || *input.OwnerDID == "" {
 		return nil, errors.New("filesdk: owner DID is required")
 	}
 
 	// Get Viewer DID
-	if input.ViewerDID == "" {
+	if input.ViewerDID == nil || *input.ViewerDID == "" {
 		return nil, errors.New("filesdk: viewer DID is required")
 	}
 
 	// Get CID
-	if input.CID == "" {
+	if input.CID == nil || *input.CID == "" {
 		return nil, errors.New("filesdk: CID is required")
 	}
 
 	// Get Capsule
-	if input.Capsule == "" {
+	if input.Capsule == nil || *input.Capsule == "" {
 		return nil, errors.New("filesdk: capsule is required")
 	}
 
@@ -127,13 +127,13 @@ func (c *Client) PostAccessibleVC(
 	}
 
 	// 1. Decode capsule
-	capsuleBytes, err := hex.DecodeString(input.Capsule)
+	capsuleBytes, err := hex.DecodeString(*input.Capsule)
 	if err != nil {
 		return nil, fmt.Errorf("filesdk: failed to decode capsule: %w", err)
 	}
 
 	// 2. Get public key from DID resolver
-	publicKey, err := c.resolver.GetPublicKey(input.ViewerDID + "#key-1")
+	publicKey, err := c.resolver.GetPublicKey(*input.ViewerDID + "#key-1")
 	if err != nil {
 		return nil, fmt.Errorf("filesdk: failed to get public key: %w", err)
 	}
@@ -163,12 +163,12 @@ func (c *Client) PostAccessibleVC(
 
 	payloadCreateVC := vc.CredentialContents{
 		Context: []interface{}{"https://www.w3.org/ns/credentials/v2"},
-		Issuer:  input.OwnerDID,
+		Issuer:  *input.OwnerDID,
 		Subject: []vc.Subject{
 			{
-				ID: input.ViewerDID,
+				ID: *input.ViewerDID,
 				CustomFields: map[string]any{
-					"cid":         input.CID,
+					"cid":         *input.CID,
 					"role":        role,
 					"permissions": permissions,
 					"capsule":     reCapsuleHex,

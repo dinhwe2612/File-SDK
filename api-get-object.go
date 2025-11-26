@@ -117,10 +117,10 @@ func (c *Client) GetObject(
 		return nil, errors.New("filesdk: auth client is not configured")
 	}
 
-	// Set owner Priv key hex if provided
-	if c.ownerPrivKeyHex != nil && *c.ownerPrivKeyHex != "" {
+	// Set viewer Priv key hex if provided
+	if c.viewerPrivKeyHex != nil && *c.viewerPrivKeyHex != "" {
 		options.providerOpts = append(
-			[]crypt.ProviderOpt{crypt.WithPrivKeyHex(*c.ownerPrivKeyHex)},
+			[]crypt.ProviderOpt{crypt.WithPrivKeyHex(*c.viewerPrivKeyHex)},
 			options.providerOpts...,
 		)
 	}

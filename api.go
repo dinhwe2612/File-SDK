@@ -33,6 +33,7 @@ type Client struct {
 	accessibleSchemaURL *string
 	issuerPrivKeyHex    *string
 	ownerPrivKeyHex     *string
+	viewerPrivKeyHex    *string
 }
 
 // AccessType represents the access type of an object
@@ -45,8 +46,8 @@ const (
 	// AccessTypePublic indicates the object is public (no encryption)
 	AccessTypePublic AccessType = "public"
 
-	// AccessTypePriv indicates the object is Priv (encrypted)
-	AccessTypePriv AccessType = "Priv"
+	// AccessTypePrivate indicates the object is private (encrypted)
+	AccessTypePrivate AccessType = "private"
 
 	// copyBufferSize is the buffer size used for copying data to multipart form.
 	// 64KB is a good balance between memory usage and performance for file uploads.
@@ -91,11 +92,10 @@ type Config struct {
 	AppPrivKeyHex *string
 	// IssuerPrivKeyHex is the Priv key hex of the issuer, used to create owner VC.
 	IssuerPrivKeyHex *string
-	// OwnerPrivKeyHex is the private key hex of the owner.
-	// Used for:
-	//   - Decrypting files when the owner downloads their own files (GetObject)
-	//   - Re-encapsulating capsules when the owner creates accessible VCs (PostAccessibleVC)
+	// OwnerPrivKeyHex is the private key hex of the owner, used to create accessible VC.
 	OwnerPrivKeyHex *string
+	// ViewerPrivKeyHex is the private key hex of the viewer, used to decrypt the file.
+	ViewerPrivKeyHex *string
 }
 
 // New creates a Client.
@@ -180,6 +180,7 @@ func New(cfg Config) (*Client, error) {
 		accessibleSchemaURL: cfg.AccessibleSchemaURL,
 		issuerPrivKeyHex:    cfg.IssuerPrivKeyHex,
 		ownerPrivKeyHex:     cfg.OwnerPrivKeyHex,
+		viewerPrivKeyHex:    cfg.ViewerPrivKeyHex,
 	}, nil
 }
 

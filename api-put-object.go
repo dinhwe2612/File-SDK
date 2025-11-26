@@ -40,7 +40,10 @@ func WithEncryptorChunkSize(chunkSize int) PutObjectOpt {
 
 // WithUploadApplicationPrivKeyHex sets application signing options used when creating the upload VP token.
 func WithUploadApplicationPrivKeyHex(privKeyHex string) PutObjectOpt {
-	privKeyBytes, _ := hex.DecodeString(privKeyHex)
+	privKeyBytes, err := hex.DecodeString(privKeyHex)
+	if err != nil {
+		return func(o *putObjectOptions) {}
+	}
 
 	return func(o *putObjectOptions) {
 		o.signOptions = append(o.signOptions, provider.WithPrivateKey(privKeyBytes))
@@ -162,7 +165,7 @@ func (c *Client) PutObject(
 
 	// Determine access level from AccessType.
 	accessLevel := "public"
-	if input.AccessType == AccessTypePriv {
+	if input.AccessType == AccessTypePrivate {
 		accessLevel = "private"
 	}
 
@@ -170,7 +173,7 @@ func (c *Client) PutObject(
 	bodyReader := input.Body
 	capsuleHex := ""
 
-	if input.AccessType == AccessTypePriv {
+	if input.AccessType == AccessTypePrivate {
 		verificationMethod := *input.Bucket + "#key-1"
 		publicKeyHex, err := c.resolver.GetPublicKey(verificationMethod)
 		if err != nil {
@@ -217,7 +220,7 @@ func (c *Client) PutObject(
 				return fmt.Errorf("filesdk: failed to write access_level field: %w", err)
 			}
 
-			if input.AccessType == AccessTypePriv && capsuleHex != "" {
+			if input.AccessType == AccessTypePrivate && capsuleHex != "" {
 				if err := writer.WriteField("capsule", capsuleHex); err != nil {
 					return fmt.Errorf("filesdk: failed to write capsule field: %w", err)
 				}

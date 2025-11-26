@@ -91,7 +91,7 @@ func runUpload() {
 			Bucket:     aws.String(ownerDID),
 			Key:        aws.String(objectName),
 			Body:       bytes.NewReader(content),
-			AccessType: filesdk.AccessTypePriv,
+			AccessType: filesdk.AccessTypePrivate,
 			IssuerDID:  aws.String(issuerDID),
 			Metadata: map[string]string{
 				"Authorization": ownerJWT,
@@ -138,6 +138,8 @@ func runCreateAccessibleVC() {
 	gatewayURL := "http://localhost:8083"
 	resolverURL := "https://auth-dev.pila.vn/api/v1/did"
 
+	appPrivKeyHex := ownerPrivKeyHex
+
 	client, err := filesdk.New(filesdk.Config{
 		Endpoint:            aws.String(gatewayURL),
 		Timeout:             30 * time.Second,
@@ -145,7 +147,7 @@ func runCreateAccessibleVC() {
 		ApplicationDID:      aws.String(applicationDID),
 		GatewayTrustJWT:     aws.String(gatewayTrustJWT),
 		AccessibleSchemaURL: aws.String(accessibleSchemaURL),
-		AppPrivKeyHex:       aws.String(ownerPrivKeyHex),
+		AppPrivKeyHex:       aws.String(appPrivKeyHex),
 		OwnerPrivKeyHex:     aws.String(ownerPrivKeyHex),
 	})
 	if err != nil {
@@ -155,10 +157,10 @@ func runCreateAccessibleVC() {
 	fmt.Println("=== Creating Accessible VC ===")
 	accessibleVCJWT, err := client.PostAccessibleVC(ctx,
 		&filesdk.PostAccessibleVCInput{
-			OwnerDID:  ownerDID,
-			ViewerDID: viewerDID,
-			CID:       cid,
-			Capsule:   capsule,
+			OwnerDID:  aws.String(ownerDID),
+			ViewerDID: aws.String(viewerDID),
+			CID:       aws.String(cid),
+			Capsule:   aws.String(capsule),
 		},
 	)
 	if err != nil {
@@ -185,6 +187,9 @@ func runDownload() {
 	gatewayURL := "http://localhost:8083"
 	resolverURL := "https://auth-dev.pila.vn/api/v1/did"
 
+	appPrivKeyHex := ownerPrivKeyHex
+	viewerPrivKeyHex := issuerPrivKeyHex
+
 	client, err := filesdk.New(filesdk.Config{
 		Endpoint:            aws.String(gatewayURL),
 		Timeout:             30 * time.Second,
@@ -192,8 +197,8 @@ func runDownload() {
 		ApplicationDID:      aws.String(applicationDID),
 		GatewayTrustJWT:     aws.String(gatewayTrustJWT),
 		AccessibleSchemaURL: aws.String(accessibleSchemaURL),
-		AppPrivKeyHex:       aws.String(ownerPrivKeyHex),
-		OwnerPrivKeyHex:     aws.String(issuerPrivKeyHex),
+		AppPrivKeyHex:       aws.String(appPrivKeyHex),
+		ViewerPrivKeyHex:    aws.String(viewerPrivKeyHex),
 	})
 	if err != nil {
 		log.Fatalf("create client: %v", err)
