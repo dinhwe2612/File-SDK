@@ -7,12 +7,14 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"mime/multipart"
 	"net/http"
 	"net/textproto"
 	"strings"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/dinhwe2612/file-sdk/pkg/credential"
 	"github.com/pilacorp/nda-auth-sdk/provider"
 	pre "github.com/pilacorp/nda-reencryption-sdk/pre"
@@ -23,34 +25,9 @@ type PutObjectOpt func(*putObjectOptions)
 
 // putObjectOptions holds configuration for PutObject call.
 type putObjectOptions struct {
-	accessType         AccessType
-	contentType        string
-	issuerDID          string
 	encryptorChunkSize int
+	issuerPrivKeyHex   string
 	signOptions        []provider.SignOption
-	headers            http.Header
-	privKeyHex         string
-}
-
-// WithAccessType sets the access type (public or private).
-func WithAccessType(accessType AccessType) PutObjectOpt {
-	return func(o *putObjectOptions) {
-		o.accessType = accessType
-	}
-}
-
-// WithContentType sets the content type of the object (for the file part).
-func WithContentType(contentType string) PutObjectOpt {
-	return func(o *putObjectOptions) {
-		o.contentType = contentType
-	}
-}
-
-// WithIssuerDID sets the issuer DID (required).
-func WithIssuerDID(issuerDID string) PutObjectOpt {
-	return func(o *putObjectOptions) {
-		o.issuerDID = issuerDID
-	}
 }
 
 // WithEncryptorChunkSize sets the chunk size for PRE encryption.
@@ -61,8 +38,8 @@ func WithEncryptorChunkSize(chunkSize int) PutObjectOpt {
 	}
 }
 
-// WithUploadApplicationPrivateKeyHex sets application signing options used when creating the upload VP token.
-func WithUploadApplicationPrivateKeyHex(privKeyHex string) PutObjectOpt {
+// WithUploadApplicationPrivKeyHex sets application signing options used when creating the upload VP token.
+func WithUploadApplicationPrivKeyHex(privKeyHex string) PutObjectOpt {
 	privKeyBytes, _ := hex.DecodeString(privKeyHex)
 
 	return func(o *putObjectOptions) {
@@ -70,42 +47,23 @@ func WithUploadApplicationPrivateKeyHex(privKeyHex string) PutObjectOpt {
 	}
 }
 
-// WithUploadHeaders sets additional HTTP headers for the upload request.
-func WithUploadHeaders(headers http.Header) PutObjectOpt {
+// WithIssuerPrivKeyHex sets the Priv key hex of the issuer.
+func WithIssuerPrivKeyHex(privKeyHex string) PutObjectOpt {
 	return func(o *putObjectOptions) {
-		if headers == nil {
-			o.headers = make(http.Header)
-			return
-		}
-		o.headers = cloneHeader(headers)
-	}
-}
-
-// WithIssuerPrivateKeyHex sets the private key hex.
-func WithIssuerPrivateKeyHex(privKeyHex string) PutObjectOpt {
-	return func(o *putObjectOptions) {
-		o.privKeyHex = privKeyHex
+		o.issuerPrivKeyHex = privKeyHex
 	}
 }
 
 // getPutObjectOptions returns the putObjectOptions with defaults applied.
 func getPutObjectOptions(opts ...PutObjectOpt) *putObjectOptions {
 	options := &putObjectOptions{
-		accessType:         AccessTypePublic,
-		contentType:        "",
-		issuerDID:          "",
 		encryptorChunkSize: encryptorChunkSize,
+		issuerPrivKeyHex:   "",
 		signOptions:        nil,
-		headers:            nil,
-		privKeyHex:         "",
 	}
 
 	for _, opt := range opts {
 		opt(options)
-	}
-
-	if options.headers == nil {
-		options.headers = make(http.Header)
 	}
 
 	return options
@@ -124,56 +82,104 @@ type UploadInfo struct {
 	OwnerVCJWT  string    `json:"owner_vc_jwt"`
 }
 
+// PutObjectInput contains all parameters for uploading an object.
+type PutObjectInput struct {
+	// Bucket is the owner DID (required).
+	Bucket *string
+	// Key is the object name (required).
+	Key *string
+	// Body is the object data stream (required).
+	Body io.Reader
+	// Metadata contains additional metadata key-value pairs.
+	// If "Authorization" is present, it will be used as the authorization header.
+	Metadata map[string]string
+	// AccessType determines if the object is public or Priv (default: AccessTypePublic).
+	AccessType AccessType
+	// IssuerDID is the DID of the issuer (required).
+	IssuerDID *string
+	// ContentType is the MIME type of the object (optional, default: "application/octet-stream").
+	ContentType *string
+}
+
+type PutObjectOutput struct {
+	SSEKMSEncryptionContext *string
+}
+
 // PutObject creates an object in a bucket with optional encryption.
-// bucketName represents the owner DID, and the returned CID is used as the object key.
+// Bucket represents the owner DID, and the returned CID is used as the object key.
 func (c *Client) PutObject(
 	ctx context.Context,
-	bucketName, objectName string,
-	reader io.Reader,
+	input *PutObjectInput,
 	opts ...PutObjectOpt,
-) (UploadInfo, error) {
+) (*PutObjectOutput, error) {
 	options := getPutObjectOptions(opts...)
 
-	if bucketName == "" {
-		return UploadInfo{}, errors.New("filesdk: owner DID (bucketName) is required")
+	// Get bucket
+	if input.Bucket == nil || *input.Bucket == "" {
+		return nil, errors.New("filesdk: owner DID (Bucket) is required")
 	}
-	if objectName == "" {
-		return UploadInfo{}, errors.New("filesdk: objectName is required")
+
+	// Get key
+	if input.Key == nil || *input.Key == "" {
+		return nil, errors.New("filesdk: object name (Key) is required")
 	}
-	if options.issuerDID == "" {
-		return UploadInfo{}, errors.New("filesdk: issuer DID is required (use WithIssuerDID)")
+
+	// Get body
+	if input.Body == nil {
+		return nil, errors.New("filesdk: body is required")
 	}
+
+	// Get issuer DID
+	if input.IssuerDID == nil || *input.IssuerDID == "" {
+		return nil, errors.New("filesdk: issuer DID is required")
+	}
+
+	// Get issuer Priv key hex
+	issuerPrivKeyHex := ""
+	if options.issuerPrivKeyHex != "" {
+		issuerPrivKeyHex = options.issuerPrivKeyHex
+	} else if c.issuerPrivKeyHex != nil {
+		issuerPrivKeyHex = *c.issuerPrivKeyHex
+	}
+	if issuerPrivKeyHex == "" {
+		return nil, errors.New("filesdk: issuer Priv key hex is not configured")
+	}
+
+	// Get application DID
 	if c.applicationDID == "" {
-		return UploadInfo{}, errors.New("filesdk: application DID is not configured")
+		return nil, errors.New("filesdk: application DID is not configured")
 	}
+
+	// Get gateway trust JWT
 	if c.gatewayTrustJWT == "" {
-		return UploadInfo{}, errors.New("filesdk: gateway trust JWT is not configured")
+		return nil, errors.New("filesdk: gateway trust JWT is not configured")
+	}
+
+	// Get accessible schema URL
+	if c.accessibleSchemaURL == nil || *c.accessibleSchemaURL == "" {
+		return nil, errors.New("filesdk: accessible schema URL is not configured")
 	}
 
 	// Determine access level from AccessType.
 	accessLevel := "public"
-	if options.accessType == AccessTypePrivate {
+	if input.AccessType == AccessTypePriv {
 		accessLevel = "private"
 	}
 
 	// Build the data source (possibly encrypted)
-	bodyReader := reader
+	bodyReader := input.Body
 	capsuleHex := ""
 
-	if options.accessType == AccessTypePrivate {
-		verificationMethod := bucketName + "#key-1"
+	if input.AccessType == AccessTypePriv {
+		verificationMethod := *input.Bucket + "#key-1"
 		publicKeyHex, err := c.resolver.GetPublicKey(verificationMethod)
 		if err != nil {
-			return UploadInfo{}, fmt.Errorf("filesdk: failed to get public key from resolver: %w", err)
-		}
-
-		if options.encryptorChunkSize <= 0 {
-			options.encryptorChunkSize = encryptorChunkSize
+			return nil, fmt.Errorf("filesdk: failed to get public key from resolver: %w", err)
 		}
 
 		enc, capsule, err := pre.NewEncryptor(publicKeyHex, uint32(options.encryptorChunkSize))
 		if err != nil {
-			return UploadInfo{}, fmt.Errorf("filesdk: failed to create encryptor: %w", err)
+			return nil, fmt.Errorf("filesdk: failed to create encryptor: %w", err)
 		}
 
 		encR, encW := io.Pipe()
@@ -185,7 +191,7 @@ func (c *Client) PutObject(
 				return
 			}
 			_ = w.Close()
-		}(reader, encW)
+		}(bodyReader, encW)
 
 		bodyReader = encR
 		capsuleHex = hex.EncodeToString(capsule)
@@ -197,54 +203,65 @@ func (c *Client) PutObject(
 
 	// Start the multipart writer in a goroutine
 	go func() {
-		defer func() {
-			_ = writer.Close()
-			_ = pw.Close()
-		}()
+		err := func() error {
+			defer writer.Close()
 
-		// Form fields
-		if err := writer.WriteField("issuer_did", options.issuerDID); err != nil {
-			_ = pw.CloseWithError(fmt.Errorf("filesdk: failed to write issuer_did field: %w", err))
-			return
-		}
-		if err := writer.WriteField("owner_did", bucketName); err != nil {
-			_ = pw.CloseWithError(fmt.Errorf("filesdk: failed to write owner_did field: %w", err))
-			return
-		}
-		if err := writer.WriteField("access_level", accessLevel); err != nil {
-			_ = pw.CloseWithError(fmt.Errorf("filesdk: failed to write access_level field: %w", err))
-			return
-		}
-
-		if options.accessType == AccessTypePrivate && capsuleHex != "" {
-			if err := writer.WriteField("capsule", capsuleHex); err != nil {
-				_ = pw.CloseWithError(fmt.Errorf("filesdk: failed to write capsule field: %w", err))
-				return
+			// Form fields
+			if err := writer.WriteField("issuer_did", *input.IssuerDID); err != nil {
+				return fmt.Errorf("filesdk: failed to write issuer_did field: %w", err)
 			}
-		}
+			if err := writer.WriteField("owner_did", *input.Bucket); err != nil {
+				return fmt.Errorf("filesdk: failed to write owner_did field: %w", err)
+			}
+			if err := writer.WriteField("access_level", accessLevel); err != nil {
+				return fmt.Errorf("filesdk: failed to write access_level field: %w", err)
+			}
 
-		// File part
-		contentType := options.contentType
-		if contentType == "" {
-			contentType = "application/octet-stream"
-		}
+			if input.AccessType == AccessTypePriv && capsuleHex != "" {
+				if err := writer.WriteField("capsule", capsuleHex); err != nil {
+					return fmt.Errorf("filesdk: failed to write capsule field: %w", err)
+				}
+			}
 
-		fileHeader := textproto.MIMEHeader{}
-		fileHeader.Set(
-			"Content-Disposition",
-			fmt.Sprintf(`form-data; name="%s"; filename="%s"`, "data", objectName),
-		)
-		fileHeader.Set("Content-Type", contentType)
+			// File part
+			contentType := ""
+			if input.ContentType != nil {
+				contentType = *input.ContentType
+			}
+			if contentType == "" {
+				contentType = "application/octet-stream"
+			}
 
-		part, err := writer.CreatePart(fileHeader)
+			fileHeader := textproto.MIMEHeader{}
+			fileHeader.Set(
+				"Content-Disposition",
+				fmt.Sprintf(`form-data; name="%s"; filename="%s"`, "data", *input.Key),
+			)
+			fileHeader.Set("Content-Type", contentType)
+
+			part, err := writer.CreatePart(fileHeader)
+			if err != nil {
+				return fmt.Errorf("filesdk: failed to create form file: %w", err)
+			}
+
+			buf := make([]byte, copyBufferSize)
+			if _, err := io.CopyBuffer(part, bodyReader, buf); err != nil {
+				return fmt.Errorf("filesdk: failed to copy data to form: %w", err)
+			}
+
+			return nil
+		}()
 		if err != nil {
-			_ = pw.CloseWithError(fmt.Errorf("filesdk: failed to create form file: %w", err))
+			slog.ErrorContext(ctx, "put object -> failed to write form fields", "error", err)
+
+			_ = pw.CloseWithError(err)
+
 			return
 		}
 
-		buf := make([]byte, copyBufferSize)
-		if _, err := io.CopyBuffer(part, bodyReader, buf); err != nil {
-			_ = pw.CloseWithError(fmt.Errorf("filesdk: failed to copy data to form: %w", err))
+		if err := pw.Close(); err != nil {
+			slog.ErrorContext(ctx, "put object -> failed to close writer", "error", err)
+
 			return
 		}
 	}()
@@ -255,11 +272,17 @@ func (c *Client) PutObject(
 	// Create request
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, targetURL, pr)
 	if err != nil {
-		return UploadInfo{}, fmt.Errorf("filesdk: failed to create request: %w", err)
+		return nil, fmt.Errorf("filesdk: failed to create request: %w", err)
 	}
 
-	// Set headers
-	c.mergeHeaders(req.Header, options.headers)
+	// Set headers from metadata
+	headers := make(http.Header)
+	if input.Metadata != nil {
+		for k, v := range input.Metadata {
+			headers.Set(k, v)
+		}
+	}
+	c.mergeHeaders(req.Header, headers)
 
 	// Set content type
 	req.Header.Set("Content-Type", writer.FormDataContentType())
@@ -267,12 +290,12 @@ func (c *Client) PutObject(
 	// Get authorization from headers
 	authorization := strings.TrimSpace(req.Header.Get(headerAuthorization))
 	if authorization == "" {
-		return UploadInfo{}, errors.New("filesdk: authorization header is required")
+		return nil, errors.New("filesdk: authorization header is required")
 	}
 
-	vpToken, _, err := c.buildVPAuthorization(ctx, authorization, options.issuerDID, options.signOptions...)
+	vpToken, _, err := c.buildVPAuthorization(ctx, authorization, *input.IssuerDID, options.signOptions...)
 	if err != nil {
-		return UploadInfo{}, fmt.Errorf("filesdk: failed to build VP authorization: %w", err)
+		return nil, fmt.Errorf("filesdk: failed to build VP authorization: %w", err)
 	}
 
 	req.Header.Set(headerAuthorization, vpToken)
@@ -280,29 +303,45 @@ func (c *Client) PutObject(
 	// Execute request
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return UploadInfo{}, fmt.Errorf("filesdk: failed to upload file: %w", err)
+		return nil, fmt.Errorf("filesdk: failed to upload file: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode >= http.StatusBadRequest {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, maxErrorBodyBytes))
-		return UploadInfo{}, fmt.Errorf("filesdk: upload failed: status=%d body=%s", resp.StatusCode, string(body))
+		return nil, fmt.Errorf("filesdk: upload failed: status=%d body=%s", resp.StatusCode, string(body))
 	}
 
 	// Decode upload response first to get CID
 	var uploadResp UploadInfo
 	if err := json.NewDecoder(resp.Body).Decode(&uploadResp); err != nil {
-		return UploadInfo{}, fmt.Errorf("filesdk: failed to decode response: %w", err)
+		return nil, fmt.Errorf("filesdk: failed to decode response: %w", err)
 	}
 
 	// Create owner file credential if we have a CID and schema configured
 	if uploadResp.CID != "" {
-		ownerVCJWT, err := credential.CreateOwnerFileCredential(ctx, uploadResp.CID, options.issuerDID, bucketName, capsuleHex, c.accessibleSchemaURL, options.privKeyHex)
+		ownerVCJWT, err := credential.CreateOwnerFileCredential(
+			ctx,
+			uploadResp.CID,
+			*input.IssuerDID,
+			*input.Bucket,
+			capsuleHex,
+			*c.accessibleSchemaURL,
+			issuerPrivKeyHex,
+		)
 		if err != nil {
-			return UploadInfo{}, fmt.Errorf("filesdk: failed to create owner file credential: %w", err)
+			return nil, fmt.Errorf("filesdk: failed to create owner file credential: %w", err)
 		}
 		uploadResp.OwnerVCJWT = ownerVCJWT
 	}
 
-	return uploadResp, nil
+	// make UploadInfo to string json
+	uploadInfoJSON, err := json.Marshal(uploadResp)
+	if err != nil {
+		return nil, fmt.Errorf("filesdk: failed to marshal upload info: %w", err)
+	}
+
+	return &PutObjectOutput{
+		SSEKMSEncryptionContext: aws.String(string(uploadInfoJSON)),
+	}, nil
 }

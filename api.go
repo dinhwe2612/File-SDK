@@ -2,6 +2,7 @@ package filesdk
 
 import (
 	"context"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"net/http"
@@ -28,7 +29,10 @@ type Client struct {
 	resolver            *verificationmethod.Resolver
 	applicationDID      string
 	gatewayTrustJWT     string
-	accessibleSchemaURL string
+	appPrivKeyHex       string
+	accessibleSchemaURL *string
+	issuerPrivKeyHex    *string
+	ownerPrivKeyHex     *string
 }
 
 // AccessType represents the access type of an object
@@ -41,8 +45,8 @@ const (
 	// AccessTypePublic indicates the object is public (no encryption)
 	AccessTypePublic AccessType = "public"
 
-	// AccessTypePrivate indicates the object is private (encrypted)
-	AccessTypePrivate AccessType = "private"
+	// AccessTypePriv indicates the object is Priv (encrypted)
+	AccessTypePriv AccessType = "Priv"
 
 	// copyBufferSize is the buffer size used for copying data to multipart form.
 	// 64KB is a good balance between memory usage and performance for file uploads.
@@ -63,41 +67,56 @@ const (
 type Config struct {
 	// Endpoint is the gateway domain (e.g., https://example.com or http://127.0.0.1:9000).
 	// The SDK will automatically append /api/v1 to the path if not already present.
-	Endpoint string
+	Endpoint *string
 	// Default timeout. If empty, uses 30 seconds.
 	Timeout time.Duration
 	// Optional default headers. For example X-Owner-Did, Authorization, etc.
 	DefaultHeaders http.Header
 	// Custom http.Client; if nil, automatically created.
 	HTTPClient *http.Client
-	// CryptProvider allows customizing how decryptors are constructed for private downloads.
-	// If nil, a DefaultProvider (using OwnerPrivateKeyHex) is used.
+	// CryptProvider allows customizing how decryptors are constructed for Priv downloads.
+	// If nil, a DefaultProvider (using OwnerPrivKeyHex) is used.
 	CryptProvider crypt.Provider
 	// Auth client for extracting VC JWTs and creating VP tokens.
 	AuthClient auth.Auth
-	// Accessible schema URL for owner file credentials.
-
 	// DID Resolver URL for resolving public keys from verification method URLs.
-	DIDResolverURL string
+	DIDResolverURL *string
 	// Application DID for creating VP token.
-	ApplicationDID string
+	ApplicationDID *string
 	// Gateway trust JWT for creating VP token.
-	GatewayTrustJWT string
+	GatewayTrustJWT *string
 	// Accessible schema URL for owner file credentials.
-	AccessibleSchemaURL string
+	AccessibleSchemaURL *string
+	// AppPrivKeyHex is the Priv key hex of the application.
+	AppPrivKeyHex *string
+	// IssuerPrivKeyHex is the Priv key hex of the issuer, used to create owner VC.
+	IssuerPrivKeyHex *string
+	// OwnerPrivKeyHex is the private key hex of the owner.
+	// Used for:
+	//   - Decrypting files when the owner downloads their own files (GetObject)
+	//   - Re-encapsulating capsules when the owner creates accessible VCs (PostAccessibleVC)
+	OwnerPrivKeyHex *string
 }
 
 // New creates a Client.
 func New(cfg Config) (*Client, error) {
-	if strings.TrimSpace(cfg.Endpoint) == "" {
+	if cfg.Endpoint == nil || *cfg.Endpoint == "" {
 		return nil, errors.New("endpoint is required")
 	}
-
-	if strings.TrimSpace(cfg.AccessibleSchemaURL) == "" {
+	if cfg.ApplicationDID == nil || *cfg.ApplicationDID == "" {
+		return nil, errors.New("application DID is required")
+	}
+	if cfg.GatewayTrustJWT == nil || *cfg.GatewayTrustJWT == "" {
+		return nil, errors.New("gateway trust JWT is required")
+	}
+	if cfg.AccessibleSchemaURL == nil || *cfg.AccessibleSchemaURL == "" {
 		return nil, errors.New("accessible schema URL is required")
 	}
+	if cfg.AppPrivKeyHex == nil || *cfg.AppPrivKeyHex == "" {
+		return nil, errors.New("app Priv key hex is required")
+	}
 
-	rawEndpoint := cfg.Endpoint
+	rawEndpoint := *cfg.Endpoint
 
 	u, err := url.Parse(rawEndpoint)
 	if err != nil {
@@ -133,19 +152,19 @@ func New(cfg Config) (*Client, error) {
 		defaultHdrs[k] = cp
 	}
 
-	// Initialize crypto provider (used by GetObject for private decryption).
+	// Initialize crypto provider (used by GetObject for Priv decryption).
 	cryptProv := cfg.CryptProvider
 	if cryptProv == nil {
 		cryptProv = &crypt.DefaultProvider{}
 	}
 
 	// Initialize resolver
-	resolver := verificationmethod.NewResolver(cfg.DIDResolverURL)
+	resolver := verificationmethod.NewResolver(*cfg.DIDResolverURL)
 
 	authClient := cfg.AuthClient
 	if authClient == nil {
 		defaultProvider := ecdsa.NewProviderPriv()
-		authClient = auth.NewAuth(defaultProvider, cfg.DIDResolverURL)
+		authClient = auth.NewAuth(defaultProvider, *cfg.DIDResolverURL)
 	}
 
 	return &Client{
@@ -154,10 +173,13 @@ func New(cfg Config) (*Client, error) {
 		defaultHdrs:         defaultHdrs,
 		cryptProvider:       cryptProv,
 		authClient:          authClient,
-		applicationDID:      cfg.ApplicationDID,
-		gatewayTrustJWT:     cfg.GatewayTrustJWT,
+		applicationDID:      *cfg.ApplicationDID,
+		gatewayTrustJWT:     *cfg.GatewayTrustJWT,
 		resolver:            resolver,
+		appPrivKeyHex:       *cfg.AppPrivKeyHex,
 		accessibleSchemaURL: cfg.AccessibleSchemaURL,
+		issuerPrivKeyHex:    cfg.IssuerPrivKeyHex,
+		ownerPrivKeyHex:     cfg.OwnerPrivKeyHex,
 	}, nil
 }
 
@@ -212,6 +234,16 @@ func (c *Client) buildVPAuthorization(
 	}
 
 	vcJWTs = append(vcJWTs, c.gatewayTrustJWT)
+
+	if c.appPrivKeyHex != "" {
+		privKeyBytes, err := hex.DecodeString(c.appPrivKeyHex)
+		if err != nil {
+			return "", "", fmt.Errorf("filesdk: failed to decode application Priv key hex: %w", err)
+		}
+		signOptions = append([]provider.SignOption{
+			provider.WithPrivateKey(privKeyBytes),
+		}, signOptions...)
+	}
 
 	vpToken, err := c.authClient.CreateToken(ctx, vcJWTs, c.applicationDID, signOptions...)
 	if err != nil {

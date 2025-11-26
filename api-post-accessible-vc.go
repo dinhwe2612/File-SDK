@@ -16,11 +16,10 @@ type PostAccessibleVCOpt func(*postAccessibleVCOptions)
 
 // postAccessibleVCOptions holds configuration for PostAccessibleVC call.
 type postAccessibleVCOptions struct {
-	accessibleSchemaURL string
-	ownerPrivateKeyHex  string
-	role                string
-	permissions         []string
-	validFrom           time.Time
+	role            string
+	permissions     []string
+	validFrom       time.Time
+	ownerPrivKeyHex string
 }
 
 // getPostAccessibleVCOptions applies functional options and sets defaults.
@@ -35,21 +34,6 @@ func getPostAccessibleVCOptions(opts ...PostAccessibleVCOpt) *postAccessibleVCOp
 		opt(o)
 	}
 	return o
-}
-
-// WithAccessibleSchemaURL sets the schema URL for the Accessible VC.
-func WithAccessibleSchemaURL(url string) PostAccessibleVCOpt {
-	return func(o *postAccessibleVCOptions) {
-		o.accessibleSchemaURL = url
-	}
-}
-
-// WithOwnerPrivateKeyHex sets the owner's private key (hex-encoded),
-// used to create the re-capsule and sign the VC.
-func WithOwnerPrivateKeyHex(hexKey string) PostAccessibleVCOpt {
-	return func(o *postAccessibleVCOptions) {
-		o.ownerPrivateKeyHex = hexKey
-	}
 }
 
 // WithDocumentRole customizes the "role" field in the VC subject.
@@ -79,59 +63,121 @@ func WithAccessibleValidFrom(t time.Time) PostAccessibleVCOpt {
 	}
 }
 
+// WithOwnerPrivKeyHex sets the owner Priv key hex.
+func WithOwnerPrivKeyHex(privKeyHex string) PostAccessibleVCOpt {
+	return func(o *postAccessibleVCOptions) {
+		if privKeyHex != "" {
+			o.ownerPrivKeyHex = privKeyHex
+		}
+	}
+}
+
+type PostAccessibleVCInput struct {
+	OwnerDID  string
+	ViewerDID string
+	CID       string
+	Capsule   string
+}
+
+type PostAccessibleVCOutput struct {
+	VCJWT *string
+}
+
 func (c *Client) PostAccessibleVC(
 	ctx context.Context,
-	ownerDID, viewerDID, cid, capsule string,
+	input *PostAccessibleVCInput,
 	opts ...PostAccessibleVCOpt,
-) (string, error) {
-	_ = ctx // currently unused, but kept for future-proofing / symmetry
-
+) (*PostAccessibleVCOutput, error) {
 	options := getPostAccessibleVCOptions(opts...)
 
-	if options.ownerPrivateKeyHex == "" {
-		return "", errors.New("filesdk: owner private key hex is required (use WithOwnerPrivateKeyHex)")
+	// Get owner Priv key hex
+	ownerPrivKeyHex := ""
+	if options.ownerPrivKeyHex != "" {
+		ownerPrivKeyHex = options.ownerPrivKeyHex
+	} else if c.ownerPrivKeyHex != nil {
+		ownerPrivKeyHex = *c.ownerPrivKeyHex
 	}
-	if options.accessibleSchemaURL == "" {
-		return "", errors.New("filesdk: accessible schema URL is required (use WithAccessibleSchemaURL)")
+	if ownerPrivKeyHex == "" {
+		return nil, errors.New("filesdk: owner Priv key hex is not configured")
+	}
+
+	// Get Owner DID
+	if input.OwnerDID == "" {
+		return nil, errors.New("filesdk: owner DID is required")
+	}
+
+	// Get Viewer DID
+	if input.ViewerDID == "" {
+		return nil, errors.New("filesdk: viewer DID is required")
+	}
+
+	// Get CID
+	if input.CID == "" {
+		return nil, errors.New("filesdk: CID is required")
+	}
+
+	// Get Capsule
+	if input.Capsule == "" {
+		return nil, errors.New("filesdk: capsule is required")
+	}
+
+	// Get accessible schema URL
+	if c.accessibleSchemaURL == nil || *c.accessibleSchemaURL == "" {
+		return nil, errors.New("filesdk: accessible schema URL is not configured")
 	}
 
 	// 1. Decode capsule
-	capsuleBytes, err := hex.DecodeString(capsule)
+	capsuleBytes, err := hex.DecodeString(input.Capsule)
 	if err != nil {
-		return "", fmt.Errorf("filesdk: failed to decode capsule: %w", err)
+		return nil, fmt.Errorf("filesdk: failed to decode capsule: %w", err)
 	}
 
 	// 2. Get public key from DID resolver
-	publicKey, err := c.resolver.GetPublicKey(viewerDID + "#key-1")
+	publicKey, err := c.resolver.GetPublicKey(input.ViewerDID + "#key-1")
 	if err != nil {
-		return "", fmt.Errorf("filesdk: failed to get public key: %w", err)
+		return nil, fmt.Errorf("filesdk: failed to get public key: %w", err)
 	}
 
 	// 3. Create re-capsule
-	reCapsule, err := pre.CreateReCapsule(options.ownerPrivateKeyHex, publicKey, capsuleBytes)
+	reCapsule, err := pre.CreateReCapsule(ownerPrivKeyHex, publicKey, capsuleBytes)
 	if err != nil {
-		return "", fmt.Errorf("filesdk: failed to create re-capsule: %w", err)
+		return nil, fmt.Errorf("filesdk: failed to create re-capsule: %w", err)
 	}
 	reCapsuleHex := hex.EncodeToString(reCapsule)
 
 	// 4. Build VC payload
+	role := "viewer"
+	if options.role != "" {
+		role = options.role
+	}
+
+	permissions := []string{"read"}
+	if len(options.permissions) > 0 {
+		permissions = options.permissions
+	}
+
+	validFrom := time.Now()
+	if !options.validFrom.IsZero() {
+		validFrom = options.validFrom
+	}
+
 	payloadCreateVC := vc.CredentialContents{
 		Context: []interface{}{"https://www.w3.org/ns/credentials/v2"},
-		Issuer:  ownerDID,
+		Issuer:  input.OwnerDID,
 		Subject: []vc.Subject{
 			{
-				ID: viewerDID,
+				ID: input.ViewerDID,
 				CustomFields: map[string]any{
-					"cid":         cid,
-					"role":        options.role,
-					"permissions": options.permissions,
+					"cid":         input.CID,
+					"role":        role,
+					"permissions": permissions,
 					"capsule":     reCapsuleHex,
 				},
 			},
 		},
 		Schemas: []vc.Schema{
 			{
-				ID:   options.accessibleSchemaURL,
+				ID:   *c.accessibleSchemaURL,
 				Type: "JsonSchema",
 			},
 		},
@@ -139,27 +185,29 @@ func (c *Client) PostAccessibleVC(
 	}
 
 	// Valid from: configured (default: now). No validUntil.
-	payloadCreateVC.ValidFrom = options.validFrom
+	payloadCreateVC.ValidFrom = validFrom
 
 	// 5. Create VC using credential SDK
 	vcJWT, err := vc.NewJWTCredential(payloadCreateVC)
 	if err != nil {
-		return "", fmt.Errorf("filesdk: failed to create VC: %w", err)
+		return nil, fmt.Errorf("filesdk: failed to create VC: %w", err)
 	}
 
-	if err := vcJWT.AddProof(options.ownerPrivateKeyHex); err != nil {
-		return "", fmt.Errorf("filesdk: failed to add proof: %w", err)
+	if err := vcJWT.AddProof(ownerPrivKeyHex); err != nil {
+		return nil, fmt.Errorf("filesdk: failed to add proof: %w", err)
 	}
 
 	serializedVC, err := vcJWT.Serialize()
 	if err != nil {
-		return "", fmt.Errorf("filesdk: failed to serialize VC: %w", err)
+		return nil, fmt.Errorf("filesdk: failed to serialize VC: %w", err)
 	}
 
 	vcStr, ok := serializedVC.(string)
 	if !ok {
-		return "", fmt.Errorf("filesdk: serialized VC is not a string (type %T)", serializedVC)
+		return nil, fmt.Errorf("filesdk: serialized VC is not a string (type %T)", serializedVC)
 	}
 
-	return vcStr, nil
+	return &PostAccessibleVCOutput{
+		VCJWT: &vcStr,
+	}, nil
 }

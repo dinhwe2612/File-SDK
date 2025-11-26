@@ -3,6 +3,7 @@ module github.com/dinhwe2612/file-sdk
 go 1.24.6
 
 require (
+	github.com/aws/aws-sdk-go-v2 v1.21.2
 	github.com/pilacorp/go-credential-sdk v1.3.0
 	github.com/pilacorp/nda-auth-sdk v0.1.3
 	github.com/pilacorp/nda-reencryption-sdk v1.0.9
@@ -10,6 +11,7 @@ require (
 
 require (
 	github.com/ProjectZKM/Ziren/crates/go-runtime/zkvm_runtime v0.0.0-20251001021608-1fe7b43fc4d6 // indirect
+	github.com/aws/smithy-go v1.15.0 // indirect
 	github.com/btcsuite/btcd/btcec/v2 v2.3.5 // indirect
 	github.com/decred/dcrd/dcrec/secp256k1/v4 v4.0.1 // indirect
 	github.com/ethereum/go-ethereum v1.16.7 // indirect

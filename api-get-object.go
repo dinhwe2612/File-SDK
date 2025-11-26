@@ -19,33 +19,25 @@ type GetObjectOpt func(*getObjectOptions)
 
 // getObjectOptions holds configuration for GetObject call.
 type getObjectOptions struct {
-	headers      http.Header
 	providerOpts []crypt.ProviderOpt
 	signOptions  []provider.SignOption
 }
 
-// WithDownloadHeaders sets custom HTTP headers for the request.
-func WithDownloadHeaders(headers http.Header) GetObjectOpt {
+// WithDecryptPrivKeyHex sets PRE decryptor/provider options.
+func WithDecryptPrivKeyHex(privKeyHex string) GetObjectOpt {
 	return func(o *getObjectOptions) {
-		// Defensive copy to avoid caller mutating after the fact
-		if headers == nil {
-			o.headers = make(http.Header)
-			return
+		o.providerOpts = append(o.providerOpts, crypt.WithPrivKeyHex(privKeyHex))
+	}
+}
+
+// WithDownloadApplicationPrivKeyHex sets application signing options used when creating download VP tokens.
+func WithDownloadApplicationPrivKeyHex(privKeyHex string) GetObjectOpt {
+	privKeyBytes, err := hex.DecodeString(privKeyHex)
+	if err != nil {
+		return func(o *getObjectOptions) {
+			// Error will be caught when hex is decoded - this is a no-op
 		}
-		o.headers = cloneHeader(headers)
 	}
-}
-
-// WithDecryptPrivateKeyHex sets PRE decryptor/provider options.
-func WithDecryptPrivateKeyHex(privKeyHex string) GetObjectOpt {
-	return func(o *getObjectOptions) {
-		o.providerOpts = append(o.providerOpts, crypt.WithPrivateKeyHex(privKeyHex))
-	}
-}
-
-// WithDownloadApplicationPrivateKeyHex sets application signing options used when creating download VP tokens.
-func WithDownloadApplicationPrivateKeyHex(privKeyHex string) GetObjectOpt {
-	privKeyBytes, _ := hex.DecodeString(privKeyHex)
 
 	return func(o *getObjectOptions) {
 		o.signOptions = append(o.signOptions, provider.WithPrivateKey(privKeyBytes))
@@ -55,7 +47,6 @@ func WithDownloadApplicationPrivateKeyHex(privKeyHex string) GetObjectOpt {
 // getGetObjectOptions returns the getObjectOptions with defaults applied.
 func getGetObjectOptions(opts ...GetObjectOpt) *getObjectOptions {
 	options := &getObjectOptions{
-		headers:      make(http.Header),
 		providerOpts: nil,
 		signOptions:  nil,
 	}
@@ -75,41 +66,67 @@ type ObjectInfo struct {
 	Metadata    http.Header
 }
 
-// GetObjectResult represents the result of a GetObject operation.
+// GetObjectInput represents the input for a GetObject operation.
+// It contains the bucket, key, and metadata.
+type GetObjectInput struct {
+	// The bucket name
+	Bucket *string
+	// The object key (CID)
+	Key *string
+	// The object metadata
+	Metadata map[string]string
+}
+
+// GetObjectOutput represents the result of a GetObject operation.
 // It contains the object data as an io.ReadCloser and metadata.
-type GetObjectResult struct {
+type GetObjectOutput struct {
 	// Body is the object data stream. The caller must close it when done.
 	Body io.ReadCloser
-	// Info contains the object metadata.
-	Info ObjectInfo
+	// Metadata contains the object metadata.
+	Metadata map[string]string
 }
 
 // GetObject retrieves an object from storage.
-// bucketName represents the viewerDID, objectName is the CID.
-// Returns a GetObjectResult containing the object data stream and metadata.
+// Bucket represents the ownerDID, Key is the CID.
+// Returns a GetObjectOutput containing the object data stream and metadata.
 // The caller must close the Body when done reading.
 func (c *Client) GetObject(
 	ctx context.Context,
-	bucketName, objectName string,
+	input *GetObjectInput,
 	opts ...GetObjectOpt,
-) (*GetObjectResult, error) {
+) (*GetObjectOutput, error) {
 	options := getGetObjectOptions(opts...)
 
-	if objectName == "" {
+	// Get key
+	if input.Key == nil || *input.Key == "" {
 		return nil, errors.New("filesdk: object name (CID) is required")
 	}
+
+	// Get application DID
 	if c.applicationDID == "" {
 		return nil, errors.New("filesdk: application DID is not configured")
 	}
+
+	// Get gateway trust JWT
 	if c.gatewayTrustJWT == "" {
 		return nil, errors.New("filesdk: gateway trust JWT is not configured")
 	}
+
+	// Get auth client
 	if c.authClient == nil {
 		return nil, errors.New("filesdk: auth client is not configured")
 	}
 
+	// Set owner Priv key hex if provided
+	if c.ownerPrivKeyHex != nil && *c.ownerPrivKeyHex != "" {
+		options.providerOpts = append(
+			[]crypt.ProviderOpt{crypt.WithPrivKeyHex(*c.ownerPrivKeyHex)},
+			options.providerOpts...,
+		)
+	}
+
 	// Build request & headers
-	targetURL := fmt.Sprintf("%s/files/%s", c.endpoint.String(), objectName)
+	targetURL := fmt.Sprintf("%s/files/%s", c.endpoint.String(), *input.Key)
 
 	// Create request
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, targetURL, nil)
@@ -118,7 +135,13 @@ func (c *Client) GetObject(
 	}
 
 	// Set headers
-	c.mergeHeaders(req.Header, options.headers)
+	headers := make(http.Header)
+	if input.Metadata != nil {
+		for key, value := range input.Metadata {
+			headers.Set(key, value)
+		}
+	}
+	c.mergeHeaders(req.Header, headers)
 
 	// Get authorization from headers
 	authorization := strings.TrimSpace(req.Header.Get(headerAuthorization))
@@ -151,15 +174,7 @@ func (c *Client) GetObject(
 		return nil, fmt.Errorf("filesdk: get object failed: status=%d", resp.StatusCode)
 	}
 
-	// Parse object info from headers
-	objectInfo := ObjectInfo{
-		CID:         objectName,
-		Size:        resp.ContentLength,
-		ContentType: resp.Header.Get("Content-Type"),
-		Metadata:    cloneHeader(resp.Header),
-	}
-
-	// Extract capsule from *original* bearer token to detect private objects.
+	// Extract capsule from *original* bearer token to detect Priv objects.
 	capsule, capErr := credential.CapsuleFromJWT(normalizedAuthorization)
 	if capErr != nil {
 		// We treat failure to extract capsule as "no capsule" → public object.
@@ -169,7 +184,7 @@ func (c *Client) GetObject(
 	// Default reader: raw response body
 	var reader io.ReadCloser = respBody
 
-	// If object is private and we have a capsule, decrypt
+	// If object is Priv and we have a capsule, decrypt
 	if capsule != "" {
 		// Get decryptor from provider
 		decryptor, err := c.cryptProvider.NewPreDecryptor(ctx, capsule, options.providerOpts...)
@@ -185,8 +200,10 @@ func (c *Client) GetObject(
 
 			if err := decryptor.DecryptStream(ctx, body, pipeWriter); err != nil {
 				_ = pipeWriter.CloseWithError(fmt.Errorf("filesdk: decrypt stream failed: %w", err))
+
 				return
 			}
+
 			_ = pipeWriter.Close()
 		}(respBody)
 
@@ -196,8 +213,17 @@ func (c *Client) GetObject(
 	// Don't close body here, let the caller close it
 	shouldCloseBody = false
 
-	return &GetObjectResult{
-		Body: reader,
-		Info: objectInfo,
+	// Convert metadata to map[string]string
+	metadata := make(map[string]string)
+	metadata["cid"] = *input.Key
+	metadata["size"] = fmt.Sprintf("%d", resp.ContentLength)
+	metadata["content-type"] = resp.Header.Get("Content-Type")
+	for key, value := range resp.Header {
+		metadata[key] = strings.Join(value, ",")
+	}
+
+	return &GetObjectOutput{
+		Body:     reader,
+		Metadata: metadata,
 	}, nil
 }
