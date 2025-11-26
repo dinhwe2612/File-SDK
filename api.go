@@ -27,7 +27,7 @@ type Client struct {
 	cryptProvider       crypt.Provider
 	authClient          auth.Auth
 	resolver            *verificationmethod.Resolver
-	applicationDID      string
+	appDID              string
 	gatewayTrustJWT     string
 	appPrivKeyHex       string
 	accessibleSchemaURL *string
@@ -83,7 +83,7 @@ type Config struct {
 	// DID Resolver URL for resolving public keys from verification method URLs.
 	DIDResolverURL *string
 	// Application DID for creating VP token.
-	ApplicationDID *string
+	AppDID *string
 	// Gateway trust JWT for creating VP token.
 	GatewayTrustJWT *string
 	// Accessible schema URL for owner file credentials.
@@ -103,7 +103,7 @@ func New(cfg Config) (*Client, error) {
 	if cfg.Endpoint == nil || *cfg.Endpoint == "" {
 		return nil, errors.New("endpoint is required")
 	}
-	if cfg.ApplicationDID == nil || *cfg.ApplicationDID == "" {
+	if cfg.AppDID == nil || *cfg.AppDID == "" {
 		return nil, errors.New("application DID is required")
 	}
 	if cfg.GatewayTrustJWT == nil || *cfg.GatewayTrustJWT == "" {
@@ -173,7 +173,7 @@ func New(cfg Config) (*Client, error) {
 		defaultHdrs:         defaultHdrs,
 		cryptProvider:       cryptProv,
 		authClient:          authClient,
-		applicationDID:      *cfg.ApplicationDID,
+		appDID:              *cfg.AppDID,
 		gatewayTrustJWT:     *cfg.GatewayTrustJWT,
 		resolver:            resolver,
 		appPrivKeyHex:       *cfg.AppPrivKeyHex,
@@ -197,17 +197,6 @@ func (c *Client) mergeHeaders(dst http.Header, extra http.Header) {
 			dst.Add(k, vv)
 		}
 	}
-}
-
-// cloneHeader copies response headers to prevent external modification of original headers.
-func cloneHeader(src http.Header) http.Header {
-	out := make(http.Header, len(src))
-	for k, v := range src {
-		cp := make([]string, len(v))
-		copy(cp, v)
-		out[k] = cp
-	}
-	return out
 }
 
 // buildVPAuthorization verifies the caller authorization header and produces a VP token.
@@ -246,7 +235,7 @@ func (c *Client) buildVPAuthorization(
 		}, signOptions...)
 	}
 
-	vpToken, err := c.authClient.CreateToken(ctx, vcJWTs, c.applicationDID, signOptions...)
+	vpToken, err := c.authClient.CreateToken(ctx, vcJWTs, c.appDID, signOptions...)
 	if err != nil {
 		return "", "", fmt.Errorf("filesdk: failed to create VP token: %w", err)
 	}

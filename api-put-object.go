@@ -14,7 +14,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/dinhwe2612/file-sdk/pkg/credential"
 	"github.com/pilacorp/nda-auth-sdk/provider"
 	pre "github.com/pilacorp/nda-reencryption-sdk/pre"
@@ -149,7 +148,7 @@ func (c *Client) PutObject(
 	}
 
 	// Get application DID
-	if c.applicationDID == "" {
+	if c.appDID == "" {
 		return nil, errors.New("filesdk: application DID is not configured")
 	}
 
@@ -344,7 +343,9 @@ func (c *Client) PutObject(
 		return nil, fmt.Errorf("filesdk: failed to marshal upload info: %w", err)
 	}
 
+	infoString := string(uploadInfoJSON)
+
 	return &PutObjectOutput{
-		SSEKMSEncryptionContext: aws.String(string(uploadInfoJSON)),
+		SSEKMSEncryptionContext: &infoString,
 	}, nil
 }

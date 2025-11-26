@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/dinhwe2612/file-sdk/pkg/credential"
 	"github.com/pilacorp/go-credential-sdk/credential/vc"
 	pre "github.com/pilacorp/nda-reencryption-sdk/pre"
 )
@@ -76,7 +77,7 @@ type PostAccessibleVCInput struct {
 	OwnerDID  *string
 	ViewerDID *string
 	CID       *string
-	Capsule   *string
+	VCOwner   *string
 }
 
 type PostAccessibleVCOutput struct {
@@ -116,36 +117,36 @@ func (c *Client) PostAccessibleVC(
 		return nil, errors.New("filesdk: CID is required")
 	}
 
-	// Get Capsule
-	if input.Capsule == nil || *input.Capsule == "" {
-		return nil, errors.New("filesdk: capsule is required")
-	}
-
 	// Get accessible schema URL
 	if c.accessibleSchemaURL == nil || *c.accessibleSchemaURL == "" {
 		return nil, errors.New("filesdk: accessible schema URL is not configured")
 	}
 
-	// 1. Decode capsule
-	capsuleBytes, err := hex.DecodeString(*input.Capsule)
+	// Get capsule from JWT
+	capsuleHex, err := credential.CapsuleFromJWT(*input.VCOwner)
+	if err != nil {
+		return nil, fmt.Errorf("filesdk: failed to get capsule from JWT: %w", err)
+	}
+
+	capsuleBytes, err := hex.DecodeString(capsuleHex)
 	if err != nil {
 		return nil, fmt.Errorf("filesdk: failed to decode capsule: %w", err)
 	}
 
-	// 2. Get public key from DID resolver
+	// Get public key from DID resolver
 	publicKey, err := c.resolver.GetPublicKey(*input.ViewerDID + "#key-1")
 	if err != nil {
 		return nil, fmt.Errorf("filesdk: failed to get public key: %w", err)
 	}
 
-	// 3. Create re-capsule
+	// Create re-capsule
 	reCapsule, err := pre.CreateReCapsule(ownerPrivKeyHex, publicKey, capsuleBytes)
 	if err != nil {
 		return nil, fmt.Errorf("filesdk: failed to create re-capsule: %w", err)
 	}
 	reCapsuleHex := hex.EncodeToString(reCapsule)
 
-	// 4. Build VC payload
+	// Build VC payload
 	role := "viewer"
 	if options.role != "" {
 		role = options.role
@@ -187,21 +188,24 @@ func (c *Client) PostAccessibleVC(
 	// Valid from: configured (default: now). No validUntil.
 	payloadCreateVC.ValidFrom = validFrom
 
-	// 5. Create VC using credential SDK
+	// Create VC using credential SDK
 	vcJWT, err := vc.NewJWTCredential(payloadCreateVC)
 	if err != nil {
 		return nil, fmt.Errorf("filesdk: failed to create VC: %w", err)
 	}
 
+	// Add proof to VC
 	if err := vcJWT.AddProof(ownerPrivKeyHex); err != nil {
 		return nil, fmt.Errorf("filesdk: failed to add proof: %w", err)
 	}
 
+	// Serialize VC
 	serializedVC, err := vcJWT.Serialize()
 	if err != nil {
 		return nil, fmt.Errorf("filesdk: failed to serialize VC: %w", err)
 	}
 
+	// Convert serialized VC to string
 	vcStr, ok := serializedVC.(string)
 	if !ok {
 		return nil, fmt.Errorf("filesdk: serialized VC is not a string (type %T)", serializedVC)

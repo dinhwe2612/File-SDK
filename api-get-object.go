@@ -103,7 +103,7 @@ func (c *Client) GetObject(
 	}
 
 	// Get application DID
-	if c.applicationDID == "" {
+	if c.appDID == "" {
 		return nil, errors.New("filesdk: application DID is not configured")
 	}
 
