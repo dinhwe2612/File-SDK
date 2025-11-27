@@ -1,36 +1,22 @@
 package filesdk
 
 import (
-	"bytes"
 	"context"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"mime/multipart"
 	"net/http"
+	"net/textproto"
+	"strings"
 	"time"
 
+	"github.com/dinhwe2612/file-sdk/pkg/credential"
+	"github.com/pilacorp/nda-auth-sdk/provider"
 	pre "github.com/pilacorp/nda-reencryption-sdk/pre"
-)
-
-// AccessType represents the access type of an object
-type AccessType string
-
-const (
-	// AccessTypePublic indicates the object is public (no encryption)
-	AccessTypePublic AccessType = "public"
-	// AccessTypePrivate indicates the object is private (encrypted)
-	AccessTypePrivate AccessType = "private"
-
-	// copyBufferSize is the buffer size used for copying data to multipart form.
-	// 64KB is a good balance between memory usage and performance for file uploads.
-	copyBufferSize = 64 * 1024
-
-	// encryptorChunkSize is the chunk size used for PRE encryption.
-	// 1MB chunk size provides good performance for encrypted file uploads.
-	encryptorChunkSize = 1 << 20 // 1MB
 )
 
 // PutObjectOpt configures PutObject call options.
@@ -38,40 +24,9 @@ type PutObjectOpt func(*putObjectOptions)
 
 // putObjectOptions holds configuration for PutObject call.
 type putObjectOptions struct {
-	accessType         AccessType
-	contentType        string
-	issuerDID          string
-	verificationMethod string
 	encryptorChunkSize int
-}
-
-// WithAccessType sets the access type (public or private).
-func WithAccessType(accessType AccessType) PutObjectOpt {
-	return func(o *putObjectOptions) {
-		o.accessType = accessType
-	}
-}
-
-// WithContentType sets the content type of the object.
-func WithContentType(contentType string) PutObjectOpt {
-	return func(o *putObjectOptions) {
-		o.contentType = contentType
-	}
-}
-
-// WithIssuerDID sets the issuer DID (required).
-func WithIssuerDID(issuerDID string) PutObjectOpt {
-	return func(o *putObjectOptions) {
-		o.issuerDID = issuerDID
-	}
-}
-
-// WithVerificationMethod sets the verification method URL (e.g., "did:example:123#key-1").
-// If not provided, defaults to "<ownerDID>#key-1".
-func WithVerificationMethod(verificationMethod string) PutObjectOpt {
-	return func(o *putObjectOptions) {
-		o.verificationMethod = verificationMethod
-	}
+	issuerPrivKeyHex   string
+	signOptions        []provider.SignOption
 }
 
 // WithEncryptorChunkSize sets the chunk size for PRE encryption.
@@ -82,14 +37,31 @@ func WithEncryptorChunkSize(chunkSize int) PutObjectOpt {
 	}
 }
 
+// WithUploadApplicationPrivKeyHex sets application signing options used when creating the upload VP token.
+func WithUploadApplicationPrivKeyHex(privKeyHex string) PutObjectOpt {
+	privKeyBytes, err := hex.DecodeString(privKeyHex)
+	if err != nil {
+		return func(o *putObjectOptions) {}
+	}
+
+	return func(o *putObjectOptions) {
+		o.signOptions = append(o.signOptions, provider.WithPrivateKey(privKeyBytes))
+	}
+}
+
+// WithIssuerPrivKeyHex sets the Priv key hex of the issuer.
+func WithIssuerPrivKeyHex(privKeyHex string) PutObjectOpt {
+	return func(o *putObjectOptions) {
+		o.issuerPrivKeyHex = privKeyHex
+	}
+}
+
 // getPutObjectOptions returns the putObjectOptions with defaults applied.
 func getPutObjectOptions(opts ...PutObjectOpt) *putObjectOptions {
 	options := &putObjectOptions{
-		accessType:         AccessTypePublic,
-		contentType:        "",
-		issuerDID:          "",
-		verificationMethod: "",
-		encryptorChunkSize: encryptorChunkSize, // Default to constant
+		encryptorChunkSize: encryptorChunkSize,
+		issuerPrivKeyHex:   "",
+		signOptions:        nil,
 	}
 
 	for _, opt := range opts {
@@ -108,133 +80,272 @@ type UploadInfo struct {
 	FileType    string    `json:"file_type"`
 	AccessLevel string    `json:"access_level"`
 	IssuerDID   string    `json:"issuer_did"`
-	Size        int64     `json:"size"`
 	Capsule     string    `json:"capsule,omitempty"`
 	OwnerVCJWT  string    `json:"owner_vc_jwt"`
 }
 
-// PutObject creates an object in a bucket with optional encryption.
-// bucketName represents the owner DID, and the returned CID is used as the object key.
-func (c *Client) PutObject(ctx context.Context, bucketName, objectName string, reader io.Reader, size int64, opts ...PutObjectOpt) (info UploadInfo, err error) {
-	if bucketName == "" {
-		return UploadInfo{}, errors.New("owner DID (bucketName) is required")
-	}
+// PutObjectInput contains all parameters for uploading an object.
+type PutObjectInput struct {
+	// Bucket is the owner DID (required).
+	Bucket *string
+	// Key is the object name (required).
+	Key *string
+	// Body is the object data stream (required).
+	Body io.Reader
+	// Metadata contains additional metadata key-value pairs.
+	// If "Authorization" is present, it will be used as the authorization header.
+	Metadata map[string]string
+	// AccessType determines if the object is public or Priv (default: AccessTypePublic).
+	AccessType AccessType
+	// IssuerDID is the DID of the issuer (required).
+	IssuerDID *string
+	// ContentType is the MIME type of the object (optional, default: "application/octet-stream").
+	ContentType *string
+}
 
-	// Parse options
+type PutObjectOutput struct {
+	SSEKMSEncryptionContext *string
+}
+
+// PutObject creates an object in a bucket with optional encryption.
+// Bucket represents the owner DID, and the returned CID is used as the object key.
+func (c *Client) PutObject(
+	ctx context.Context,
+	input *PutObjectInput,
+	opts ...PutObjectOpt,
+) (*PutObjectOutput, error) {
 	options := getPutObjectOptions(opts...)
 
-	if options.issuerDID == "" {
-		return UploadInfo{}, errors.New("issuer DID is required (use WithIssuerDID option)")
+	// Get bucket
+	if input.Bucket == nil || *input.Bucket == "" {
+		return nil, errors.New("filesdk: owner DID (Bucket) is required")
 	}
 
-	// Determine access level from AccessType
+	// Get key
+	if input.Key == nil || *input.Key == "" {
+		return nil, errors.New("filesdk: object name (Key) is required")
+	}
+
+	// Get body
+	if input.Body == nil {
+		return nil, errors.New("filesdk: body is required")
+	}
+
+	// Get issuer DID
+	if input.IssuerDID == nil || *input.IssuerDID == "" {
+		return nil, errors.New("filesdk: issuer DID is required")
+	}
+
+	// Get issuer Priv key hex
+	issuerPrivKeyHex := ""
+	if options.issuerPrivKeyHex != "" {
+		issuerPrivKeyHex = options.issuerPrivKeyHex
+	} else if c.issuerPrivKeyHex != nil {
+		issuerPrivKeyHex = *c.issuerPrivKeyHex
+	}
+	if issuerPrivKeyHex == "" {
+		return nil, errors.New("filesdk: issuer Priv key hex is not configured")
+	}
+
+	// Get application DID
+	if c.appDID == "" {
+		return nil, errors.New("filesdk: application DID is not configured")
+	}
+
+	// Get gateway trust JWT
+	if c.gatewayTrustJWT == "" {
+		return nil, errors.New("filesdk: gateway trust JWT is not configured")
+	}
+
+	// Get accessible schema URL
+	if c.accessibleSchemaURL == nil || *c.accessibleSchemaURL == "" {
+		return nil, errors.New("filesdk: accessible schema URL is not configured")
+	}
+
+	// Determine access level from AccessType.
 	accessLevel := "public"
-	if options.accessType == AccessTypePrivate {
+	if input.AccessType == AccessTypePrivate {
 		accessLevel = "private"
 	}
 
-	// Encrypt if private
-	var bodyReader io.Reader = reader
-	var encryptedAESKey string
-	if options.accessType == AccessTypePrivate {
-		// Use default verification method if not provided
-		verificationMethod := bucketName + "#key-1"
-		if options.verificationMethod != "" {
-			verificationMethod = options.verificationMethod
-		}
+	// Build the data source (possibly encrypted)
+	bodyReader := input.Body
+	capsuleHex := ""
 
-		// Get public key from resolver
+	if input.AccessType == AccessTypePrivate {
+		verificationMethod := *input.Bucket + "#key-1"
 		publicKeyHex, err := c.resolver.GetPublicKey(verificationMethod)
 		if err != nil {
-			return UploadInfo{}, fmt.Errorf("failed to get public key from resolver: %w", err)
+			return nil, fmt.Errorf("filesdk: failed to get public key from resolver: %w", err)
 		}
 
-		// Create encryptor directly with public key
 		enc, capsule, err := pre.NewEncryptor(publicKeyHex, uint32(options.encryptorChunkSize))
 		if err != nil {
-			return UploadInfo{}, fmt.Errorf("failed to create encryptor: %w", err)
+			return nil, fmt.Errorf("filesdk: failed to create encryptor: %w", err)
 		}
 
-		// Encrypt the data stream
-		pipeReader, pipeWriter := io.Pipe()
-		go func() {
-			defer pipeWriter.Close()
-			if err := enc.EncryptStream(ctx, reader, pipeWriter); err != nil {
-				pipeWriter.CloseWithError(err)
+		encR, encW := io.Pipe()
+
+		// Encrypt in background: reader -> enc -> encW
+		go func(r io.Reader, w *io.PipeWriter) {
+			if err := enc.EncryptStream(ctx, r, w); err != nil {
+				_ = w.CloseWithError(fmt.Errorf("filesdk: encrypt stream failed: %w", err))
+				return
 			}
+			_ = w.Close()
+		}(bodyReader, encW)
+
+		bodyReader = encR
+		capsuleHex = hex.EncodeToString(capsule)
+	}
+
+	// Build streaming multipart body via io.Pipe
+	pr, pw := io.Pipe()
+	writer := multipart.NewWriter(pw)
+
+	// Start the multipart writer in a goroutine
+	go func() {
+		err := func() error {
+			defer writer.Close()
+
+			// Form fields
+			if err := writer.WriteField("issuer_did", *input.IssuerDID); err != nil {
+				return fmt.Errorf("filesdk: failed to write issuer_did field: %w", err)
+			}
+			if err := writer.WriteField("owner_did", *input.Bucket); err != nil {
+				return fmt.Errorf("filesdk: failed to write owner_did field: %w", err)
+			}
+			if err := writer.WriteField("access_level", accessLevel); err != nil {
+				return fmt.Errorf("filesdk: failed to write access_level field: %w", err)
+			}
+
+			if input.AccessType == AccessTypePrivate && capsuleHex != "" {
+				if err := writer.WriteField("capsule", capsuleHex); err != nil {
+					return fmt.Errorf("filesdk: failed to write capsule field: %w", err)
+				}
+			}
+
+			// File part
+			contentType := ""
+			if input.ContentType != nil {
+				contentType = *input.ContentType
+			}
+			if contentType == "" {
+				contentType = "application/octet-stream"
+			}
+
+			fileHeader := textproto.MIMEHeader{}
+			fileHeader.Set(
+				"Content-Disposition",
+				fmt.Sprintf(`form-data; name="%s"; filename="%s"`, "data", *input.Key),
+			)
+			fileHeader.Set("Content-Type", contentType)
+
+			part, err := writer.CreatePart(fileHeader)
+			if err != nil {
+				return fmt.Errorf("filesdk: failed to create form file: %w", err)
+			}
+
+			buf := make([]byte, copyBufferSize)
+			if _, err := io.CopyBuffer(part, bodyReader, buf); err != nil {
+				return fmt.Errorf("filesdk: failed to copy data to form: %w", err)
+			}
+
+			return nil
 		}()
+		if err != nil {
+			slog.ErrorContext(ctx, "put object -> failed to write form fields", "error", err)
 
-		bodyReader = pipeReader
-		encryptedAESKey = hex.EncodeToString(capsule)
-	}
+			_ = pw.CloseWithError(err)
 
-	// Create multipart form
-	var buf bytes.Buffer
-	writer := multipart.NewWriter(&buf)
+			return
+		}
 
-	// Add form fields
-	writer.WriteField("issuer_did", options.issuerDID)
-	writer.WriteField("owner_did", bucketName)
-	writer.WriteField("access_level", accessLevel)
+		if err := pw.Close(); err != nil {
+			slog.ErrorContext(ctx, "put object -> failed to close writer", "error", err)
 
-	// Use encrypted AES key as capsule if private, otherwise use provided capsule
-	if options.accessType == AccessTypePrivate && encryptedAESKey != "" {
-		writer.WriteField("capsule", encryptedAESKey)
-	}
-	if options.accessType == AccessTypePrivate {
-		writer.WriteField("encrypt_type", "rsa-aes")
-	}
+			return
+		}
+	}()
 
-	// Add file field
-	contentType := options.contentType
-	if contentType == "" {
-		contentType = "application/octet-stream"
-	}
-
-	part, err := writer.CreateFormFile("data", objectName)
-	if err != nil {
-		return UploadInfo{}, fmt.Errorf("failed to create form file: %w", err)
-	}
-
-	// Use CopyBuffer for better performance with large files
-	copyBuf := make([]byte, copyBufferSize)
-	if _, err := io.CopyBuffer(part, bodyReader, copyBuf); err != nil {
-		return UploadInfo{}, fmt.Errorf("failed to copy data to form: %w", err)
-	}
-
-	writer.Close()
-
-	// Build URL for file upload endpoint
-	// The endpoint already includes /api/v1, so we just append /files/upload
+	// Build request & headers
 	targetURL := fmt.Sprintf("%s/files/upload", c.endpoint.String())
 
 	// Create request
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, targetURL, &buf)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, targetURL, pr)
 	if err != nil {
-		return UploadInfo{}, fmt.Errorf("failed to create request: %w", err)
+		return nil, fmt.Errorf("filesdk: failed to create request: %w", err)
 	}
 
-	// Set headers - bucketName is used as issuerDID
+	// Set headers from metadata
+	headers := make(http.Header)
+	if input.Metadata != nil {
+		for k, v := range input.Metadata {
+			headers.Set(k, v)
+		}
+	}
+	c.mergeHeaders(req.Header, headers)
+
+	// Set content type
 	req.Header.Set("Content-Type", writer.FormDataContentType())
-	req.Header.Set("X-Issuer-Did", bucketName)
+
+	// Get authorization from headers
+	authorization := strings.TrimSpace(req.Header.Get(headerAuthorization))
+	if authorization == "" {
+		return nil, errors.New("filesdk: authorization header is required")
+	}
+
+	vpToken, _, err := c.buildVPAuthorization(ctx, authorization, *input.IssuerDID, options.signOptions...)
+	if err != nil {
+		return nil, fmt.Errorf("filesdk: failed to build VP authorization: %w", err)
+	}
+
+	req.Header.Set(headerAuthorization, vpToken)
 
 	// Execute request
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return UploadInfo{}, fmt.Errorf("failed to upload file: %w", err)
+		return nil, fmt.Errorf("filesdk: failed to upload file: %w", err)
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode >= 400 {
+	if resp.StatusCode >= http.StatusBadRequest {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, maxErrorBodyBytes))
-		return UploadInfo{}, fmt.Errorf("upload failed: status=%d body=%s", resp.StatusCode, string(body))
+		return nil, fmt.Errorf("filesdk: upload failed: status=%d body=%s", resp.StatusCode, string(body))
 	}
 
-	// Parse JSON response
+	// Decode upload response first to get CID
 	var uploadResp UploadInfo
 	if err := json.NewDecoder(resp.Body).Decode(&uploadResp); err != nil {
-		return UploadInfo{}, fmt.Errorf("failed to decode response: %w", err)
+		return nil, fmt.Errorf("filesdk: failed to decode response: %w", err)
 	}
 
-	return uploadResp, nil
+	// Create owner file credential if we have a CID and schema configured
+	if uploadResp.CID != "" {
+		ownerVCJWT, err := credential.CreateOwnerFileCredential(
+			ctx,
+			uploadResp.CID,
+			*input.IssuerDID,
+			*input.Bucket,
+			capsuleHex,
+			*c.accessibleSchemaURL,
+			issuerPrivKeyHex,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("filesdk: failed to create owner file credential: %w", err)
+		}
+		uploadResp.OwnerVCJWT = ownerVCJWT
+	}
+
+	// make UploadInfo to string json
+	uploadInfoJSON, err := json.Marshal(uploadResp)
+	if err != nil {
+		return nil, fmt.Errorf("filesdk: failed to marshal upload info: %w", err)
+	}
+
+	infoString := string(uploadInfoJSON)
+
+	return &PutObjectOutput{
+		SSEKMSEncryptionContext: &infoString,
+	}, nil
 }

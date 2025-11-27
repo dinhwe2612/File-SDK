@@ -14,14 +14,14 @@ type ProviderOpt func(*providerOptions)
 
 // providerOptions holds configuration for provider operations.
 type providerOptions struct {
-	privateKeyHex string
+	privKeyHex    string
 	customOptions map[string]any
 }
 
 // WithPrivateKeyHex sets the private key in hex format.
-func WithPrivateKeyHex(privateKeyHex string) ProviderOpt {
+func WithPrivKeyHex(privKeyHex string) ProviderOpt {
 	return func(o *providerOptions) {
-		o.privateKeyHex = privateKeyHex
+		o.privKeyHex = privKeyHex
 	}
 }
 
@@ -35,7 +35,7 @@ func WithCustomProvider(customOptions map[string]any) ProviderOpt {
 // getProviderOptions returns the providerOptions with defaults applied.
 func getProviderOptions(opts ...ProviderOpt) *providerOptions {
 	options := &providerOptions{
-		privateKeyHex: "",
+		privKeyHex:    "",
 		customOptions: make(map[string]any),
 	}
 
@@ -58,8 +58,8 @@ func (p *DefaultProvider) NewPreDecryptor(ctx context.Context, capsule string, o
 	}
 
 	options := getProviderOptions(opts...)
-	if options.privateKeyHex == "" {
-		return nil, errors.New("owner private key hex is required (use WithPrivateKeyHex option)")
+	if options.privKeyHex == "" {
+		return nil, errors.New("owner private key hex is required")
 	}
 
 	capsuleBytes, err := hex.DecodeString(capsule)
@@ -68,8 +68,8 @@ func (p *DefaultProvider) NewPreDecryptor(ctx context.Context, capsule string, o
 	}
 
 	if len(capsuleBytes) == 185 {
-		return pre.NewDecryptorByOwner(options.privateKeyHex, capsuleBytes)
+		return pre.NewDecryptorByOwner(options.privKeyHex, capsuleBytes)
 	} else {
-		return pre.NewDecryptor(options.privateKeyHex, capsuleBytes)
+		return pre.NewDecryptor(options.privKeyHex, capsuleBytes)
 	}
 }
